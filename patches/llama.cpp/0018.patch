@@ -1,0 +1,247 @@
+From a5bce5b6d608d552971c4ed77b30c9d562a47ca5 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Mon, 13 Jul 2026 08:15:08 -0400
+Subject: [PATCH 18/26] Add confidence-gated online EVM prefetch
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 140 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index e39219d72..0fe27ae12 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -302,6 +302,9 @@ private:
+     std::unordered_map<int, std::list<int>::iterator> cache_map;
+     std::list<int> lru_list;
+     std::vector<CacheSlot> slots;
++    std::vector<uint64_t> transition_counts;
++    std::vector<int> last_routed_experts;
++    std::unordered_set<int> prefetched_experts;
+     
+     bool initialized = false;
+     bool strict_budget = false;
+@@ -325,6 +328,8 @@ public:
+     uint64_t metric_bytes_transferred = 0;
+     uint64_t metric_evictions = 0;
+     uint64_t metric_pack_substitutions = 0;
++    uint64_t metric_predictor_prefetches = 0;
++    uint64_t metric_predictor_hits = 0;
+ 
+ public:
+     Manager() {}
+@@ -339,6 +344,8 @@ public:
+                 fprintf(stderr, "Bytes Transferred: %llu (%.2f MB)\n", (unsigned long long)metric_bytes_transferred, (double)metric_bytes_transferred / (1024*1024));
+                 fprintf(stderr, "Hit Rate         : %.2f%%\n", 100.0 * metric_cache_hits / total);
+                 fprintf(stderr, "Pack Substitutions: %llu\n", (unsigned long long) metric_pack_substitutions);
++                fprintf(stderr, "Predictor Prefetches: %llu\n", (unsigned long long) metric_predictor_prefetches);
++                fprintf(stderr, "Predictor Hits   : %llu\n", (unsigned long long) metric_predictor_hits);
+                 fflush(stderr);
+             }
+             if (const char * profile_path = getenv("EVM_ROUTING_PROFILE_PATH")) {
+@@ -387,6 +394,112 @@ public:
+         abort();
+     }
+ 
++    std::list<int>::iterator eviction_candidate(const std::unordered_set<int> & protected_ids) {
++        auto it = lru_list.end();
++        while (it != lru_list.begin()) {
++            --it;
++            const int logical = slots[*it].logical_expert_id;
++            if (logical < 0 || (pinned_experts.find(logical) == pinned_experts.end() && protected_ids.find(logical) == protected_ids.end())) {
++                return it;
++            }
++        }
++        return lru_list.end();
++    }
++
++    void queue_predictive_prefetch_locked(const std::vector<int> & current_ids) {
++        if (read_env_ll("EVM_ONLINE_PREDICTOR", 0) == 0 || ability_pack_only || current_ids.empty()) {
++            last_routed_experts = current_ids;
++            return;
++        }
++
++        for (const int previous : last_routed_experts) {
++            for (const int current : current_ids) {
++                transition_counts[(size_t) previous * total_experts + current]++;
++            }
++        }
++
++        const int prefetch_budget = std::max(0, std::min(4, (int) read_env_ll("EVM_PREDICTOR_PREFETCH", 1)));
++        const uint64_t min_count = (uint64_t) std::max(1LL, read_env_ll("EVM_PREDICTOR_MIN_COUNT", 2));
++        const int min_confidence_pct = std::max(0, std::min(100, (int) read_env_ll("EVM_PREDICTOR_MIN_CONFIDENCE_PCT", 35)));
++        if (prefetch_budget == 0 || transition_counts.empty()) {
++            last_routed_experts = current_ids;
++            return;
++        }
++
++        std::vector<uint64_t> scores((size_t) total_experts, 0);
++        std::unordered_set<int> protected_ids(current_ids.begin(), current_ids.end());
++        for (const int source : current_ids) {
++            for (int candidate = 0; candidate < total_experts; ++candidate) {
++                scores[(size_t) candidate] += transition_counts[(size_t) source * total_experts + candidate];
++            }
++        }
++
++        int queued = 0;
++        while (queued < prefetch_budget) {
++            int candidate = -1;
++            uint64_t best_score = min_count - 1;
++            uint64_t total_score = 0;
++            for (int expert = 0; expert < total_experts; ++expert) {
++                if (cache_map.find(expert) == cache_map.end() &&
++                    protected_ids.find(expert) == protected_ids.end() &&
++                    pinned_experts.find(expert) == pinned_experts.end()) {
++                    total_score += scores[(size_t) expert];
++                }
++                if (scores[(size_t) expert] > best_score &&
++                    cache_map.find(expert) == cache_map.end() &&
++                    protected_ids.find(expert) == protected_ids.end() &&
++                    pinned_experts.find(expert) == pinned_experts.end()) {
++                    candidate = expert;
++                    best_score = scores[(size_t) expert];
++                }
++            }
++            if (candidate < 0) {
++                break;
++            }
++            if (total_score == 0 || best_score * 100 < total_score * (uint64_t) min_confidence_pct) {
++                break;
++            }
++
++            auto victim = eviction_candidate(protected_ids);
++            if (victim == lru_list.end()) {
++                break;
++            }
++            const int physical = *victim;
++            lru_list.erase(victim);
++            const int old_logical = slots[physical].logical_expert_id;
++            if (old_logical >= 0) {
++                cache_map.erase(old_logical);
++                prefetched_experts.erase(old_logical);
++                if (metrics_enabled) {
++                    metric_evictions++;
++                }
++            }
++
++            slots[physical].logical_expert_id = candidate;
++            const char * source = source_from_vault
++                ? vault_registry().expert_data(vault_tensor_name, candidate, (size_t) expert_size_bytes)
++                : h_experts_mmap + (size_t) candidate * expert_size_bytes;
++            const size_t offset = (size_t) physical * expert_size_bytes;
++            if (source_on_device || !staged_h2d_copy(
++                    d_pool + offset, source, (size_t) expert_size_bytes, stream)) {
++                CUDA_CHECK(cudaMemcpyAsync(
++                    d_pool + offset, source, expert_size_bytes,
++                    source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, stream));
++            }
++            if (metrics_enabled) {
++                metric_bytes_transferred += expert_size_bytes;
++                metric_predictor_prefetches++;
++            }
++            lru_list.push_front(physical);
++            cache_map[candidate] = lru_list.begin();
++            prefetched_experts.insert(candidate);
++            scores[(size_t) candidate] = 0;
++            ++queued;
++        }
++
++        last_routed_experts = current_ids;
++    }
++
+     void preload_ability_experts() {
+         if (!ability_enabled) return;
+         const size_t required = ability_experts.size() + (ability_pack_only ? 0 : 1);
+@@ -495,6 +608,7 @@ public:
+         
+         total_experts = num_total_experts;
+         expert_access_counts.assign((size_t) total_experts, 0);
++        transition_counts.assign((size_t) total_experts * total_experts, 0);
+         expert_size_bytes = bytes_per_expert;
+         strict_budget = read_env_ll("EVM_STRICT_BUDGET", 0) != 0;
+         metrics_enabled = read_env_ll("EVM_DISABLE_METRICS", 0) == 0;
+@@ -676,6 +790,9 @@ public:
+                 lru_list.erase(it->second);
+                 lru_list.push_front(phys_idx);
+                 cache_map[log_id] = lru_list.begin();
++                if (prefetched_experts.erase(log_id) != 0 && metrics_enabled) {
++                    metric_predictor_hits++;
++                }
+                 logical_ids[i] = phys_idx;
+             } else {
+                 if (metrics_enabled) {
+@@ -691,6 +808,7 @@ public:
+                         metric_evictions++;
+                     }
+                     cache_map.erase(old_log);
++                    prefetched_experts.erase(old_log);
+                 }
+                 
+                 slots[phys_idx].logical_expert_id = log_id;
+@@ -749,6 +867,13 @@ public:
+             cudaStreamWaitEvent(compute_stream, event, 0);
+         }
+ 
++        std::vector<int> current_ids;
++        current_ids.reserve(unique_ids.size());
++        for (const int logical : unique_ids) {
++            current_ids.push_back(logical);
++        }
++        queue_predictive_prefetch_locked(current_ids);
++
+     }
+ 
+     void ensure_experts_with_fixed_mapping(
+@@ -914,6 +1039,13 @@ public:
+         metric_evictions = 0;
+         metric_bytes_transferred = 0;
+         metric_pack_substitutions = 0;
++        metric_predictor_prefetches = 0;
++        metric_predictor_hits = 0;
++        prefetched_experts.clear();
++        last_routed_experts.clear();
++        if (read_env_ll("EVM_PREDICTOR_PERSIST", 0) == 0) {
++            std::fill(transition_counts.begin(), transition_counts.end(), 0);
++        }
+         if (reset_expert_cache && !ability_pack_only) {
+             reset_cache_state();
+             if (ability_enabled) preload_ability_experts();
+@@ -938,6 +1070,8 @@ inline void print_all_stats() {
+     uint64_t total_evictions = 0;
+     uint64_t total_bytes_transferred = 0;
+     uint64_t total_pack_substitutions = 0;
++    uint64_t total_predictor_prefetches = 0;
++    uint64_t total_predictor_hits = 0;
+ 
+     for (auto& pair : managers) {
+         if (!pair.second) continue;
+@@ -946,6 +1080,8 @@ inline void print_all_stats() {
+         total_evictions += pair.second->metric_evictions;
+         total_bytes_transferred += pair.second->metric_bytes_transferred;
+         total_pack_substitutions += pair.second->metric_pack_substitutions;
++        total_predictor_prefetches += pair.second->metric_predictor_prefetches;
++        total_predictor_hits += pair.second->metric_predictor_hits;
+     }
+ 
+     const uint64_t total = total_hits + total_misses;
+@@ -960,6 +1096,8 @@ inline void print_all_stats() {
+     fprintf(stderr, "Bytes Transferred: %llu (%.2f MB)\n", (unsigned long long)total_bytes_transferred, (double)total_bytes_transferred / (1024*1024));
+     fprintf(stderr, "Hit Rate         : %.2f%%\n", 100.0 * total_hits / total);
+     fprintf(stderr, "Pack Substitutions: %llu\n", (unsigned long long) total_pack_substitutions);
++    fprintf(stderr, "Predictor Prefetches: %llu\n", (unsigned long long) total_predictor_prefetches);
++    fprintf(stderr, "Predictor Hits   : %llu\n", (unsigned long long) total_predictor_hits);
+ 
+     // Clear counters so later explicit calls and manager destructors do not double-report.
+     for (auto& pair : managers) {
+@@ -969,6 +1107,8 @@ inline void print_all_stats() {
+         pair.second->metric_evictions = 0;
+         pair.second->metric_bytes_transferred = 0;
+         pair.second->metric_pack_substitutions = 0;
++        pair.second->metric_predictor_prefetches = 0;
++        pair.second->metric_predictor_hits = 0;
+     }
+     fflush(stderr);
+ }
+-- 
+2.43.0.windows.1
+

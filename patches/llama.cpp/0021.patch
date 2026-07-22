@@ -1,0 +1,28 @@
+From 65a6bd44ed09d7f7e0e39680a3c5609b7d9698df Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Tue, 14 Jul 2026 01:26:50 -0400
+Subject: [PATCH 21/26] Report infeasible strict EVM pool budgets
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 2655e7cad..7af0213b7 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -621,9 +621,10 @@ public:
+         const int requested = std::max(1, std::min(new_capacity, total_experts));
+         if (strict_budget && budget_max_capacity > 0 && requested > budget_max_capacity) {
+             fprintf(stderr,
+-                    "EVM: strict budget exceeded: requested %d experts, budget allows %d. "
++                    "EVM_BUDGET_NO_GO: strict budget exceeded: requested %d experts, budget allows %d. "
+                     "Increase EVM_EXPERT_POOL_MB/EVM_CUDA_FREE_RESERVE_MB or reduce prefill batch size.\n",
+                     requested, budget_max_capacity);
++            fflush(stderr);
+             abort();
+         }
+ 
+-- 
+2.43.0.windows.1
+

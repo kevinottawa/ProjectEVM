@@ -1,0 +1,122 @@
+From e3d93b13bfa17f258cf5436dcd6bc609870341fa Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 00:27:54 -0400
+Subject: [PATCH 14/26] Add explicit GPU-resident expert pack mode
+
+---
+ ggml/src/ggml-backend.cpp       |  4 ++--
+ ggml/src/ggml-cuda/evm.cuh      | 28 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  2 +-
+ src/llama-model-loader.cpp      |  8 ++++++--
+ 4 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 42d56d777..c578f0177 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1013,7 +1013,7 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+ }
+ 
+ static bool ggml_backend_sched_evm_streaming_src(const struct ggml_tensor * node, const struct ggml_tensor * src) {
+-    if (!getenv("EVM_CPU_BACKING") || !getenv("EVM_CUDA_STREAMING")) {
++    if ((!getenv("EVM_CPU_BACKING") && !getenv("EVM_GPU_PACK_ONLY")) || !getenv("EVM_CUDA_STREAMING")) {
+         return false;
+     }
+     if (node == nullptr || src == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] != src) {
+@@ -1031,7 +1031,7 @@ static bool ggml_backend_sched_evm_streaming_src(const struct ggml_tensor * node
+ }
+ 
+ static int ggml_backend_sched_evm_streaming_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
+-    if (!getenv("EVM_CPU_BACKING") || !getenv("EVM_CUDA_STREAMING")) {
++    if ((!getenv("EVM_CPU_BACKING") && !getenv("EVM_GPU_PACK_ONLY")) || !getenv("EVM_CUDA_STREAMING")) {
+         return -1;
+     }
+     if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || !ggml_backend_sched_evm_streaming_src(node, node->src[0])) {
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 72ff55512..660360dbc 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -35,6 +35,8 @@ private:
+     bool attempted = false;
+     bool available = false;
+     std::unordered_map<std::string, std::vector<VaultSlice>> slices;
++    std::unordered_set<std::string> gpu_preloaded_tensors;
++    std::mutex preload_mutex;
+ #if defined(_WIN32)
+     HANDLE file = INVALID_HANDLE_VALUE;
+     HANDLE mapping = nullptr;
+@@ -158,6 +160,29 @@ public:
+         return nullptr;
+ #endif
+     }
++
++    void mark_gpu_pack_preloaded(const std::string & tensor, size_t expected_tensors) {
++        if (getenv("EVM_GPU_PACK_ONLY") == nullptr) return;
++        std::lock_guard<std::mutex> lock(preload_mutex);
++        gpu_preloaded_tensors.insert(tensor);
++        if (gpu_preloaded_tensors.size() < expected_tensors) return;
++#if defined(_WIN32)
++        if (base) {
++            UnmapViewOfFile(base);
++            base = nullptr;
++        }
++        if (mapping) {
++            CloseHandle(mapping);
++            mapping = nullptr;
++        }
++        if (file != INVALID_HANDLE_VALUE) {
++            CloseHandle(file);
++            file = INVALID_HANDLE_VALUE;
++        }
++#endif
++        available = false;
++        fprintf(stderr, "EVM: GPU pack preload complete; released external pack mapping\n");
++    }
+ };
+ 
+ inline VaultRegistry & vault_registry() {
+@@ -386,6 +411,9 @@ public:
+         }
+         for (int physical = (int) ability_experts.size(); physical < capacity; ++physical) lru_list.push_back(physical);
+         CUDA_CHECK(cudaStreamSynchronize(stream));
++        if (ability_pack_only) {
++            vault_registry().mark_gpu_pack_preloaded(vault_tensor_name, ability_pack_experts().size());
++        }
+     }
+ 
+     void resize_pool_locked(int new_capacity) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 46a196a1d..79910224b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1768,7 +1768,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+ 
+ static bool ggml_cuda_evm_is_active() {
+     return getenv("EVM_DISABLE") == nullptr &&
+-        (getenv("EVM_CPU_BACKING") != nullptr || getenv("EVM_CUDA_STREAMING") != nullptr || getenv("EVM_CAPACITY_PCT") != nullptr);
++        (getenv("EVM_CPU_BACKING") != nullptr || getenv("EVM_GPU_PACK_ONLY") != nullptr || getenv("EVM_CUDA_STREAMING") != nullptr || getenv("EVM_CAPACITY_PCT") != nullptr);
+ }
+ 
+ static bool ggml_cuda_evm_fusion_aware_enabled() {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 4bcd2a388..2fffaf164 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1300,8 +1300,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     };
+ 
+     if (const auto * vault_meta = evm_vault_find_tensor_meta(tn.str())) {
+-        if (getenv("EVM_CUDA_STREAMING") == nullptr || getenv("EVM_CPU_BACKING") == nullptr) {
+-            throw std::runtime_error("EVM expert vault requires EVM_CPU_BACKING=1 and EVM_CUDA_STREAMING=1");
++        const bool gpu_pack_only = getenv("EVM_GPU_PACK_ONLY") != nullptr;
++        if (getenv("EVM_CUDA_STREAMING") == nullptr || (getenv("EVM_CPU_BACKING") == nullptr && !gpu_pack_only)) {
++            throw std::runtime_error("EVM expert vault requires CUDA streaming and either CPU backing or GPU pack-only mode");
++        }
++        if (gpu_pack_only && (getenv("EVM_ABILITY_PACK_ONLY") == nullptr || atoi(getenv("EVM_ABILITY_PACK_ONLY")) == 0)) {
++            throw std::runtime_error("EVM_GPU_PACK_ONLY requires EVM_ABILITY_PACK_ONLY=1");
+         }
+         if (ne.size() > GGML_MAX_DIMS) {
+             throw std::runtime_error(format("too many dimensions for EVM expert vault tensor %s", tn.str().c_str()));
+-- 
+2.43.0.windows.1
+

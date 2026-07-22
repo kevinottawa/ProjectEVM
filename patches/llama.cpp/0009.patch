@@ -1,0 +1,162 @@
+From d64f3a3f50611d99292be369612993fc996c29b5 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 02:43:50 -0400
+Subject: [PATCH 09/26] Enforce compact EVM pools and async reuse
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 66 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 47c63bcc1..c80cf810e 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -31,10 +31,15 @@ private:
+     char* h_experts_mmap = nullptr;
+     int* d_physical_ids = nullptr;
+     int d_physical_ids_capacity = 0;
++    int* h_physical_ids[2] = {nullptr, nullptr};
++    cudaEvent_t physical_ids_events[2] = {nullptr, nullptr};
++    bool physical_ids_event_recorded[2] = {false, false};
++    int physical_ids_stage_index = 0;
+     bool source_on_device = false;
+     
+     cudaStream_t stream;
+     cudaEvent_t event;
++    cudaEvent_t pool_reuse_event;
+     
+     std::unordered_map<int, std::list<int>::iterator> cache_map;
+     std::list<int> lru_list;
+@@ -77,6 +82,11 @@ public:
+             }
+             cudaStreamDestroy(stream);
+             cudaEventDestroy(event);
++            cudaEventDestroy(pool_reuse_event);
++            for (int i = 0; i < 2; ++i) {
++                if (physical_ids_events[i]) cudaEventDestroy(physical_ids_events[i]);
++                if (h_physical_ids[i]) cudaFreeHost(h_physical_ids[i]);
++            }
+         }
+         if (d_pool) cudaFree(d_pool);
+         if (d_physical_ids) cudaFree(d_physical_ids);
+@@ -131,6 +141,14 @@ public:
+         if (d_physical_ids) {
+             cudaFree(d_physical_ids);
+         }
++        for (int i = 0; i < 2; ++i) {
++            if (physical_ids_event_recorded[i]) {
++                CUDA_CHECK(cudaEventSynchronize(physical_ids_events[i]));
++                physical_ids_event_recorded[i] = false;
++            }
++            if (h_physical_ids[i]) cudaFreeHost(h_physical_ids[i]);
++            CUDA_CHECK(cudaMallocHost(&h_physical_ids[i], (size_t)new_capacity * sizeof(int)));
++        }
+         d_physical_ids = new_ids;
+         d_physical_ids_capacity = new_capacity;
+         if (getenv("EVM_DEBUG")) {
+@@ -138,6 +156,23 @@ public:
+         }
+     }
+ 
++    void upload_physical_ids_locked(const int * ids, int count) {
++        ensure_physical_ids_capacity_locked(count);
++        const int stage = physical_ids_stage_index++ % 2;
++        if (physical_ids_event_recorded[stage]) {
++            CUDA_CHECK(cudaEventSynchronize(physical_ids_events[stage]));
++        }
++        std::copy(ids, ids + count, h_physical_ids[stage]);
++        CUDA_CHECK(cudaMemcpyAsync(
++            d_physical_ids,
++            h_physical_ids[stage],
++            (size_t) count * sizeof(int),
++            cudaMemcpyHostToDevice,
++            stream));
++        CUDA_CHECK(cudaEventRecord(physical_ids_events[stage], stream));
++        physical_ids_event_recorded[stage] = true;
++    }
++
+ public:
+     void init(int num_experts_capacity, int bytes_per_expert, char* original_d_ptr, int num_total_experts) {
+         std::lock_guard<std::mutex> lock(mtx);
+@@ -171,6 +206,11 @@ public:
+         }
+ 
+         requested_capacity = std::max(1, std::min(num_experts_capacity, total_experts));
++        const int fixed_capacity = (int) read_env_ll("EVM_EXPERTS_PER_TENSOR", 0);
++        if (fixed_capacity > 0) {
++            requested_capacity = std::max(1, std::min(fixed_capacity, total_experts));
++            budget_max_capacity = std::min(budget_max_capacity, requested_capacity);
++        }
+         if (budget_max_capacity > 0) {
+             requested_capacity = std::min(requested_capacity, budget_max_capacity);
+         }
+@@ -193,8 +233,12 @@ public:
+         }
+         
+         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+-        cudaEventCreate(&event);
+-        
++        cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
++        cudaEventCreateWithFlags(&pool_reuse_event, cudaEventDisableTiming);
++        for (int i = 0; i < 2; ++i) {
++            cudaEventCreateWithFlags(&physical_ids_events[i], cudaEventDisableTiming);
++        }
++
+         reset_cache_state();
+         
+         initialized = true;
+@@ -243,10 +287,10 @@ public:
+         if (!is_initialized()) return;
+         std::lock_guard<std::mutex> lock(mtx);
+         
+-        // CRITICAL RACE CONDITION FIX:
+-        // We must wait for the GPU to finish any previous kernels on compute_stream
+-        // before we overwrite d_physical_ids or evict any experts from d_pool.
+-        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
++        // Preserve pool correctness without blocking the CPU. The transfer stream
++        // waits for all previously queued compute before it reuses pool slots.
++        CUDA_CHECK(cudaEventRecord(pool_reuse_event, compute_stream));
++        CUDA_CHECK(cudaStreamWaitEvent(stream, pool_reuse_event, 0));
+         
+         std::unordered_set<int> unique_ids;
+         for (int i = 0; i < count; ++i) {
+@@ -336,15 +380,14 @@ public:
+                     count, min_physical, max_physical, capacity, unique_ids.size());
+         }
+         
+-        // Now it's safe to overwrite d_physical_ids because compute_stream is idle
+-        // Use synchronous cudaMemcpy so logical_ids (h_ids vector) doesn't go out of scope!
+-        CUDA_CHECK(cudaMemcpy(d_physical_ids, logical_ids, count * sizeof(int), cudaMemcpyHostToDevice));
++        upload_physical_ids_locked(logical_ids, count);
+         needs_sync = true;
+         
+         if (needs_sync) {
+             cudaEventRecord(event, stream);
+             cudaStreamWaitEvent(compute_stream, event, 0);
+         }
++
+     }
+ 
+     void ensure_experts_with_fixed_mapping(
+@@ -356,7 +399,8 @@ public:
+         if (!is_initialized()) return;
+         std::lock_guard<std::mutex> lock(mtx);
+ 
+-        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
++        CUDA_CHECK(cudaEventRecord(pool_reuse_event, compute_stream));
++        CUDA_CHECK(cudaStreamWaitEvent(stream, pool_reuse_event, 0));
+ 
+         if ((int) logical_to_physical.size() > capacity) {
+             resize_pool_locked((int) logical_to_physical.size());
+@@ -470,7 +514,7 @@ public:
+                     count, min_physical, max_physical, capacity, logical_to_physical.size());
+         }
+ 
+-        CUDA_CHECK(cudaMemcpy(d_physical_ids, physical_ids, count * sizeof(int), cudaMemcpyHostToDevice));
++        upload_physical_ids_locked(physical_ids, count);
+         needs_sync = true;
+ 
+         if (needs_sync) {
+-- 
+2.43.0.windows.1
+

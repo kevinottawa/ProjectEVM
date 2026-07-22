@@ -1,0 +1,38 @@
+From 1f8c25d2d4992c8e77ecc67bddd30cc681f6767e Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Thu, 9 Jul 2026 16:22:26 -0400
+Subject: [PATCH 02/26] Add phase-aware EVM pool budget controls
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 36246e1e0..4e76e8a00 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -199,7 +199,20 @@ public:
+             threshold = std::max(1, atoi(env));
+         }
+ 
+-        const int target_capacity = batch_size > threshold ? total_experts : requested_capacity;
++        int prefill_capacity = total_experts;
++        if (const char * env = getenv("EVM_PREFILL_CAPACITY_PCT")) {
++            int prefill_pct = atoi(env);
++            if (prefill_pct < 1) prefill_pct = 1;
++            if (prefill_pct > 100) prefill_pct = 100;
++            prefill_capacity = std::max(1, (total_experts * prefill_pct) / 100);
++        }
++        if (const long long prefill_mb = read_env_ll("EVM_PREFILL_POOL_MB", 0); prefill_mb > 0) {
++            const long long prefill_bytes = prefill_mb * 1024LL * 1024LL;
++            const int cap_by_pool = (int) (prefill_bytes / std::max(1, expert_size_bytes));
++            prefill_capacity = std::max(1, std::min(prefill_capacity, cap_by_pool));
++        }
++
++        const int target_capacity = batch_size > threshold ? prefill_capacity : requested_capacity;
+         resize_pool_locked(target_capacity);
+     }
+ 
+-- 
+2.43.0.windows.1
+

@@ -1,0 +1,9 @@
+mode,generation_tps,peak_gpu_memory_mb,peak_process_rss_mb,pagefile_used_delta_mb,has_evm_counters,status
+Strict trim,0.4,9146,4762,0,True,PASS
+Lazy mmap,0.6,9095,24160,49,True,PASS
+Pinned x2,0.4,9386,4786,0,True,PASS
+Pinned x4,0.4,9329,4755,70,True,PASS
+Pinned x8,0.4,9265,4742,0,True,PASS
+Cache 8G,0.4,9193,9449,0,True,PASS
+Cache 12G,0.4,9156,13907,0,True,PASS
+Cache 16G,0.3,9153,16525,86,True,PASS

@@ -1,0 +1,7 @@
+configuration,mode,capacity,confidence_pct,trials,generation_tps,peak_vram_mb,hit_rate_pct,transfer_mb,prefetches,predictor_hits
+initial_35,lru,8,,3,11.1,2898,29.52,39338.86,0,0
+initial_35,predictor,8,35,3,9.67,2898,31.34,46855.19,4705,1395
+confidence_50,lru,8,,2,11.55,2898,29.83,38868.15,0,0
+confidence_50,predictor,8,50,2,10.65,2898,29.91,38970.0,82.5,42
+capacity10_confidence_50,lru,10,,2,10.9,3130,35.42,35801.74,0,0
+capacity10_confidence_50,predictor,10,50,2,10.2,3130,35.29,36049.57,96,25.5

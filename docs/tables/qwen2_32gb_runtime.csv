@@ -1,0 +1,9 @@
+scenario,status,trials,generation_tps,peak_vram_mb,system_ram_delta_mb,pagefile_delta_mb,cache_hit_rate_pct,note
+exact_8_slot_lru,pass,3,0.93,9009,24104,0,36.2,32 GB host; full-reference hash gate did not complete
+exact_8_slot_learned,pass,3,0.93,9008,24244,1,36.2,32 GB host; full-reference hash gate did not complete
+reserve_8gb_learned,no_go,0,,15994,6415,0,,minimum exact expert pool exceeded declared GPU headroom before EVM counters
+reserve_8gb_lru,no_go,0,,15994,6800,0,,minimum exact expert pool exceeded declared GPU headroom before EVM counters
+reserve_4gb_learned,no_go,0,,20041,6880,0,,minimum exact expert pool exceeded declared GPU headroom before EVM counters
+reserve_4gb_lru,no_go,0,,20041,6929,0,,minimum exact expert pool exceeded declared GPU headroom before EVM counters
+reserve_6gb_learned,no_go,0,,18039,6824,0,,minimum exact expert pool exceeded declared GPU headroom before EVM counters
+reserve_6gb_lru,no_go,0,,18039,6605,0,,minimum exact expert pool exceeded declared GPU headroom before EVM counters

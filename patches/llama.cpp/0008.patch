@@ -1,0 +1,118 @@
+From d058186751ae5a5460d5472af88d4c7a8d4fb6ff Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Thu, 9 Jul 2026 23:07:52 -0400
+Subject: [PATCH 08/26] Add EVM metrics disable switch
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 36 +++++++++++++++++++++++++++---------
+ 1 file changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 740434b5b..47c63bcc1 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -42,6 +42,7 @@ private:
+     
+     bool initialized = false;
+     bool strict_budget = false;
++    bool metrics_enabled = true;
+     std::mutex mtx;
+ 
+     static long long read_env_ll(const char * name, long long default_value = 0) {
+@@ -65,7 +66,7 @@ public:
+     ~Manager() {
+         if (initialized) {
+             uint64_t total = metric_cache_hits + metric_cache_misses;
+-            if (total > 0) {
++            if (metrics_enabled && total > 0) {
+                 fprintf(stderr, "\n[EVM Metrics]\n");
+                 fprintf(stderr, "Cache Hits       : %llu\n", (unsigned long long)metric_cache_hits);
+                 fprintf(stderr, "Cache Misses     : %llu\n", (unsigned long long)metric_cache_misses);
+@@ -145,6 +146,7 @@ public:
+         total_experts = num_total_experts;
+         expert_size_bytes = bytes_per_expert;
+         strict_budget = read_env_ll("EVM_STRICT_BUDGET", 0) != 0;
++        metrics_enabled = read_env_ll("EVM_DISABLE_METRICS", 0) == 0;
+ 
+         budget_max_capacity = total_experts;
+         const long long pool_mb = read_env_ll("EVM_EXPERT_POOL_MB", 0);
+@@ -271,20 +273,26 @@ public:
+             
+             auto it = cache_map.find(log_id);
+             if (it != cache_map.end()) {
+-                metric_cache_hits++;
++                if (metrics_enabled) {
++                    metric_cache_hits++;
++                }
+                 int phys_idx = *(it->second);
+                 lru_list.erase(it->second);
+                 lru_list.push_front(phys_idx);
+                 cache_map[log_id] = lru_list.begin();
+                 logical_ids[i] = phys_idx;
+             } else {
+-                metric_cache_misses++;
++                if (metrics_enabled) {
++                    metric_cache_misses++;
++                }
+                 int phys_idx = lru_list.back();
+                 lru_list.pop_back();
+                 
+                 int old_log = slots[phys_idx].logical_expert_id;
+                 if (old_log != -1) {
+-                    metric_evictions++;
++                    if (metrics_enabled) {
++                        metric_evictions++;
++                    }
+                     cache_map.erase(old_log);
+                 }
+                 
+@@ -299,7 +307,9 @@ public:
+                     expert_size_bytes,
+                     source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+                     stream));
+-                metric_bytes_transferred += expert_size_bytes;
++                if (metrics_enabled) {
++                    metric_bytes_transferred += expert_size_bytes;
++                }
+                 needs_sync = true;
+                 
+                 lru_list.push_front(phys_idx);
+@@ -373,15 +383,21 @@ public:
+             }
+ 
+             if (slots[phys_idx].logical_expert_id == log_id) {
+-                metric_cache_hits++;
++                if (metrics_enabled) {
++                    metric_cache_hits++;
++                }
+                 continue;
+             }
+ 
+-            metric_cache_misses++;
++            if (metrics_enabled) {
++                metric_cache_misses++;
++            }
+ 
+             const int old_log_at_phys = slots[phys_idx].logical_expert_id;
+             if (old_log_at_phys != -1) {
+-                metric_evictions++;
++                if (metrics_enabled) {
++                    metric_evictions++;
++                }
+             }
+ 
+             for (auto & slot : slots) {
+@@ -402,7 +418,9 @@ public:
+                 expert_size_bytes,
+                 source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+                 stream));
+-            metric_bytes_transferred += expert_size_bytes;
++            if (metrics_enabled) {
++                metric_bytes_transferred += expert_size_bytes;
++            }
+             needs_sync = true;
+         }
+ 
+-- 
+2.43.0.windows.1
+

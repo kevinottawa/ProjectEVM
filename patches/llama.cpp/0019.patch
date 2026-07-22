@@ -1,0 +1,33 @@
+From ba0e6779308ab31bcabad9c11fc9e7b1a978dd68 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Mon, 13 Jul 2026 16:28:23 -0400
+Subject: [PATCH 19/26] Fix routing observatory expert vector layout
+
+---
+ examples/routing-observatory/routing-observatory.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/examples/routing-observatory/routing-observatory.cpp b/examples/routing-observatory/routing-observatory.cpp
+index 34a525457..6f1226d2c 100644
+--- a/examples/routing-observatory/routing-observatory.cpp
++++ b/examples/routing-observatory/routing-observatory.cpp
+@@ -32,8 +32,14 @@ static bool observatory_cb_eval(struct ggml_tensor * t, bool ask, void * user_da
+         }
+         float * probs = is_host ? (float*)t->data : (float*)data.data();
+         
+-        int n_expert = t->ne[0];
+-        int n_tokens = t->ne[1];
++        // Most MoE models expose [experts, tokens]; DeepSeek exposes
++        // [1, experts, tokens]. Normalize both layouts for the trace schema.
++        const bool leading_singleton = t->ne[0] == 1 && t->ne[1] > 1;
++        const int n_expert = leading_singleton ? t->ne[1] : t->ne[0];
++        const int n_tokens = leading_singleton ? t->ne[2] : t->ne[1];
++        if (n_expert <= 1 || n_tokens <= 0) {
++            return true;
++        }
+         
+         for (int tok = 0; tok < n_tokens; tok++) {
+             fprintf(obs->out_file, "{\"prompt_id\": %d, \"layer_id\": %d, \"token_idx\": %d, \"probs\": [", obs->prompt_id, il, obs->token_base + tok);
+-- 
+2.43.0.windows.1
+

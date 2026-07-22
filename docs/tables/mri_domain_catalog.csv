@@ -1,0 +1,27 @@
+group,domain,description,excludes,contrast_domains,calibration,validation,held_out
+computer_agent,code_generation,Implement code from an explicit behavioral specification,Debugging or reviewing existing code,debugging;code_review,4,1,1
+computer_agent,debugging,Diagnose and repair faulty program behavior,Greenfield implementation or style-only review,code_generation;code_review,4,1,1
+computer_agent,code_review,"Inspect existing code for correctness, security, performance, and maintainability",Implementing a new feature,debugging;systems_programming,4,1,1
+computer_agent,systems_programming,"Reason about C, C++, CUDA, memory, concurrency, and operating-system interfaces",General application coding,code_generation;debugging,4,1,1
+computer_agent,web_development,"Build and reason about browser interfaces, web APIs, state, and accessibility",Generic programming without web behavior,code_generation;technical_writing,4,1,1
+computer_agent,data_scripting,"Transform structured data using Python, SQL, shell tools, and statistics",General code generation without a data task,structured_output;mathematics,4,1,1
+computer_agent,tool_calling,"Select tools, construct valid arguments, interpret results, and recover from tool errors",Planning without an external action,planning;structured_output,4,1,1
+computer_agent,planning,"Decompose objectives, order dependencies, track progress, and revise execution plans",Executing tools or writing implementation details,tool_calling;business_operations,4,1,1
+computer_agent,structured_output,"Produce exact schemas, JSON, tables, manifests, and constrained formats",Unconstrained prose,tool_calling;instruction_following,4,1,1
+computer_agent,repository_navigation,Locate code ownership and connect behavior across repository modules,Reviewing code already supplied,code_review;planning,4,1,1
+professional_reasoning,technical_writing,"Write documentation, specifications, reports, and precise explanations",Creative prose or research comparison,research_synthesis;creative_writing,4,1,1
+professional_reasoning,business_operations,"Reason about requirements, process design, project coordination, and operational decisions",Financial calculation or technical implementation,planning;financial_analysis,4,1,1
+professional_reasoning,scientific_reasoning,"Form hypotheses, reason causally, and design controlled experiments",Simple scientific fact recall,factual_recall;research_synthesis,4,1,1
+professional_reasoning,mathematics,"Perform arithmetic, algebra, probability, geometry, and symbolic reasoning",Scientific experimental design,formal_logic;financial_analysis,4,1,1
+professional_reasoning,formal_logic,"Apply symbolic, deductive, and constraint-based reasoning",Numerical calculation,mathematics;planning,4,1,1
+professional_reasoning,research_synthesis,"Compare evidence, identify disagreement, and form qualified conclusions",Unsourced factual recall or original experimentation,technical_writing;scientific_reasoning,4,1,1
+professional_reasoning,legal_style_reasoning,"Interpret rules, exceptions, obligations, and fact patterns without providing legal certification",Jurisdiction-specific legal advice,formal_logic;business_operations,4,1,1
+professional_reasoning,medical_style_reasoning,"Handle symptom uncertainty, triage language, and safety escalation without diagnosing",Personal diagnosis or treatment prescription,scientific_reasoning;safety_refusal,4,1,1
+professional_reasoning,financial_analysis,"Reason about accounting, percentages, cash flow, risk, and financial comparisons",Personalized investment recommendations,mathematics;business_operations,4,1,1
+language_human,instruction_following,"Follow exact content, format, length, and multi-step constraints",Safety refusal or schema-specific output,structured_output;safety_refusal,4,1,1
+language_human,safety_refusal,Refuse unsafe or dishonest requests while preserving useful benign assistance,General instruction following,instruction_following;medical_style_reasoning,4,1,1
+language_human,conversation_support,"Recognize intent, clarify ambiguity, maintain tone, and provide emotionally appropriate support",Clinical counseling or creative roleplay,instruction_following;creative_writing,4,1,1
+language_human,creative_writing,"Produce narrative, dialogue, imagery, style transformation, and ideation",Technical documentation,technical_writing;conversation_support,4,1,1
+language_human,multilingual_work,Translate and reason across languages while preserving meaning and register,English-only factual recall,factual_recall;conversation_support,4,1,1
+language_human,factual_recall,"Recall common historical, geographic, scientific, and cultural facts",Causal scientific reasoning or research synthesis,scientific_reasoning;research_synthesis,4,1,1
+language_human,long_context_synthesis,Retrieve and combine evidence distributed across a long supplied context,Recall from model parameters alone,research_synthesis;instruction_following,4,1,1

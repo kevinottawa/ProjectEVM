@@ -1,0 +1,18 @@
+{
+  "format": "evm-workflow-quality-contract-v1",
+  "description": "Compact deterministic, baseline-relative checks for the computer/agent workflow pack.",
+  "tasks": [
+    {"id": "arithmetic", "domain": "mathematics", "prompt": "Answer only: 3 + 4 =", "pattern": "\\b7\\b"},
+    {"id": "geography", "domain": "factual_recall", "prompt": "Answer only: the capital of France is", "pattern": "paris"},
+    {"id": "chemistry", "domain": "factual_recall", "prompt": "Answer only: the chemical formula for water is", "pattern": "h\\s*2\\s*o"},
+    {"id": "antonym", "domain": "language_human", "prompt": "Answer only: the opposite of hot is", "pattern": "cold"},
+    {"id": "code_generation", "domain": "code_generation", "prompt": "Answer only: binary search time complexity is", "pattern": "log"},
+    {"id": "debugging", "domain": "debugging", "prompt": "Answer only: dereferencing a null pointer is safe. true or false?", "pattern": "false|unsafe|no"},
+    {"id": "code_review", "domain": "code_review", "prompt": "Answer only: building SQL by concatenating untrusted input risks", "pattern": "injection"},
+    {"id": "systems_programming", "domain": "systems_programming", "prompt": "Answer only: memory passed to cudaMemcpyAsync must remain valid until the copy completes. true or false?", "pattern": "true|yes"},
+    {"id": "tool_calling", "domain": "tool_calling", "prompt": "Return only valid JSON with tool set to file_search and query set to CMakeLists.txt.", "pattern": "file_search.*CMakeLists|CMakeLists.*file_search"},
+    {"id": "planning", "domain": "planning", "prompt": "Answer only with the safe database migration order: backup, migrate, verify.", "pattern": "backup.*migrate.*verify"},
+    {"id": "structured_output", "domain": "structured_output", "prompt": "Return only valid JSON with name set to evm and enabled set to true.", "pattern": "name.*evm.*enabled.*true|enabled.*true.*name.*evm"},
+    {"id": "repository_navigation", "domain": "repository_navigation", "prompt": "Answer only: the command-line tool to search for a symbol across a repository is", "pattern": "rg|ripgrep"}
+  ]
+}

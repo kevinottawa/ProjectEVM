@@ -1,0 +1,7 @@
+model,capacity_pct,method,baseline_passed,total,quality_passed,retained_baseline_passes,baseline_opportunities,runtime_valid,generation_tps,peak_vram_mb,pack_substitutions
+qwen1,75.0,frequency,9,12,2,2,9,True,48.3,6439,0
+qwen1,75.0,graph,9,12,0,0,9,True,48.3,6439,0
+deepseek,75.0,frequency,9,12,2,2,9,True,23.5,8597,0
+deepseek,75.0,graph,9,12,3,3,9,True,23.5,8597,0
+qwen2,37.5,frequency,9,12,0,0,9,True,36.7,16213,0
+qwen2,37.5,graph,9,12,0,0,9,True,36.7,16213,0

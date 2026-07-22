@@ -1,0 +1,111 @@
+From 222c1b759a572537f4118ded2501243294c45529 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 19:43:02 -0400
+Subject: [PATCH 16/26] Add persistent workflow quality evaluation
+
+---
+ .../evm-batch-profiler/evm-batch-profiler.cpp | 35 ++++++++++++++++---
+ 1 file changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/examples/evm-batch-profiler/evm-batch-profiler.cpp b/examples/evm-batch-profiler/evm-batch-profiler.cpp
+index 3e271ae28..fd5bbc59b 100644
+--- a/examples/evm-batch-profiler/evm-batch-profiler.cpp
++++ b/examples/evm-batch-profiler/evm-batch-profiler.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
++#include <regex>
+ #include <string>
+ #include <unordered_set>
+ #include <vector>
+@@ -17,6 +18,7 @@ struct prompt_row {
+     std::string domain;
+     std::string split;
+     std::string prompt;
++    std::string pattern;
+ };
+ 
+ static bool arg_value(int argc, char ** argv, const char * flag, std::string & value) {
+@@ -47,12 +49,19 @@ static std::vector<prompt_row> load_manifest(const std::string & path) {
+     std::ifstream input(path);
+     json suite = json::parse(input);
+     std::vector<prompt_row> rows;
++    if (suite.contains("tasks")) {
++        for (const auto & task : suite["tasks"]) {
++            rows.push_back({task.at("id").get<std::string>(), task.value("domain", "quality"), "quality",
++                            task.at("prompt").get<std::string>(), task.value("pattern", "")});
++        }
++        return rows;
++    }
+     const std::string split = suite.value("split", "calibration");
+     for (auto & item : suite["domains"].items()) {
+         int index = 0;
+         for (const auto & prompt : item.value()["prompts"]) {
+             ++index;
+-            rows.push_back({item.key() + "." + split + "." + std::to_string(index), item.key(), split, prompt.get<std::string>()});
++            rows.push_back({item.key() + "." + split + "." + std::to_string(index), item.key(), split, prompt.get<std::string>(), ""});
+         }
+     }
+     return rows;
+@@ -81,6 +90,8 @@ int main(int argc, char ** argv) {
+     if (arg_value(argc, argv, "-c", value)) n_ctx = std::stoi(value);
+     if (arg_value(argc, argv, "-ngl", value)) n_gpu_layers = std::stoi(value);
+     const bool cold_experts = has_flag(argc, argv, "--cold-experts");
++    const bool evm_profile = !has_flag(argc, argv, "--no-evm-profile");
++    const bool ignore_eos = has_flag(argc, argv, "--ignore-eos");
+ 
+     const auto prompts = load_manifest(manifest_path);
+     auto completed = load_checkpoint(checkpoint_path);
+@@ -123,30 +134,44 @@ int main(int argc, char ** argv) {
+         auto generation_started = started;
+         int generated = 0;
+         uint64_t fingerprint = 1469598103934665603ULL;
++        std::string response;
+         if (valid) {
+             llama_batch batch = llama_batch_get_one(tokens.data(), token_count);
+             valid = llama_decode(context, batch) == 0;
+             llama_synchronize(context);
+-            valid = valid && ggml_backend_cuda_evm_profile_snapshot(profile_path.c_str(), item.id.c_str(), "prefill", true);
++            valid = valid && (!evm_profile || ggml_backend_cuda_evm_profile_snapshot(profile_path.c_str(), item.id.c_str(), "prefill", true));
+             generation_started = std::chrono::steady_clock::now();
+         }
+         for (int step = 0; valid && step < n_predict; ++step) {
+             llama_token token = llama_sampler_sample(sampler, context, -1);
+-            if (llama_vocab_is_eog(vocab, token)) break;
++            if (llama_vocab_is_eog(vocab, token) && !ignore_eos) break;
+             llama_sampler_accept(sampler, token);
+             fingerprint = fingerprint_token(fingerprint, token);
++            char piece[256];
++            const int piece_length = llama_token_to_piece(vocab, token, piece, sizeof(piece), 0, true);
++            if (piece_length > 0) response.append(piece, static_cast<size_t>(piece_length));
+             ++generated;
+             llama_batch batch = llama_batch_get_one(&token, 1);
+             if (llama_decode(context, batch) != 0) valid = false;
+         }
+         llama_synchronize(context);
+-        valid = ggml_backend_cuda_evm_profile_snapshot(profile_path.c_str(), item.id.c_str(), "generation", true) && valid;
++        valid = (!evm_profile || ggml_backend_cuda_evm_profile_snapshot(profile_path.c_str(), item.id.c_str(), "generation", true)) && valid;
+         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+         const double generation_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_started).count();
++        bool quality_pass = true;
++        if (!item.pattern.empty()) {
++            try {
++                quality_pass = std::regex_search(response, std::regex(item.pattern, std::regex_constants::icase));
++            } catch (const std::regex_error &) {
++                valid = false;
++                quality_pass = false;
++            }
++        }
+         rows << json({{"prompt_id", item.id}, {"domain", item.domain}, {"split", item.split}, {"valid", valid},
+                      {"prompt_tokens", token_count}, {"generated_tokens", generated}, {"elapsed_s", elapsed},
+                      {"generation_elapsed_s", generation_elapsed}, {"generation_tps", generation_elapsed > 0 ? generated / generation_elapsed : 0},
+-                     {"token_fingerprint_fnv1a64", std::to_string(fingerprint)}, {"cold_experts", cold_experts}}).dump() << '\n';
++                     {"token_fingerprint_fnv1a64", std::to_string(fingerprint)}, {"cold_experts", cold_experts},
++                     {"quality_pass", quality_pass}}).dump() << '\n';
+         rows.flush();
+         if (valid) {
+             checkpoint << item.id << '\n';
+-- 
+2.43.0.windows.1
+

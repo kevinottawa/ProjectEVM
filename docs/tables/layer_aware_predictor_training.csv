@@ -1,0 +1,4 @@
+model,valid_prompts,trace_rows,layers,experts,test_capacity,lru_hit_rate_pct,learned_hit_rate_pct,oracle_hit_rate_pct,gap_closed_pct,selected_prefetch_budget,deployment_status
+deepseek,24,42250,27,64,8,61.97,67.0,67.0,100.0,0,offline_policy_evaluation_only
+qwen1,24,37748,24,60,8,58.07,62.54,62.54,100.0,0,offline_policy_evaluation_only
+qwen2,8,9264,28,64,8,60.15,65.2,65.2,100.0,0,offline_policy_evaluation_only

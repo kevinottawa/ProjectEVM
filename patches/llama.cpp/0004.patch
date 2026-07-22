@@ -1,0 +1,90 @@
+From beea4c856d5d8373c9409c2a51ec629a13c6b743 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Thu, 9 Jul 2026 16:34:40 -0400
+Subject: [PATCH 04/26] Add EVM CPU-backed CUDA streaming scheduler path
+
+---
+ ggml/src/ggml-backend.cpp | 46 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 87615921c..3534389a4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -864,6 +864,9 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
+     return -1;
+ }
+ 
++static bool ggml_backend_sched_evm_streaming_src(const struct ggml_tensor * node, const struct ggml_tensor * src);
++static int  ggml_backend_sched_evm_streaming_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
++
+ #if 0
+ #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
+ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
+@@ -905,6 +908,12 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+         return cur_backend_id;
+     }
+ 
++    const int evm_backend_id = ggml_backend_sched_evm_streaming_backend(sched, tensor);
++    if (evm_backend_id != -1) {
++        SET_CAUSE(tensor, "1.evm");
++        return evm_backend_id;
++    }
++
+     // operations with weights are preferably run on the same backend as the weights
+     for (int i = 0; i < GGML_MAX_SRC; i++) {
+         const struct ggml_tensor * src = tensor->src[i];
+@@ -1003,6 +1012,38 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+ }
+ 
++static bool ggml_backend_sched_evm_streaming_src(const struct ggml_tensor * node, const struct ggml_tensor * src) {
++    if (!getenv("EVM_CPU_BACKING") || !getenv("EVM_CUDA_STREAMING")) {
++        return false;
++    }
++    if (node == nullptr || src == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] != src) {
++        return false;
++    }
++    if (src->buffer == nullptr || src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_backend_buffer_is_host(src->buffer)) {
++        return false;
++    }
++    int target_count = 0;
++    if (const char * env = getenv("EVM_TARGET_EXPERT_COUNT")) {
++        target_count = atoi(env);
++    }
++    return target_count <= 0 || src->ne[2] == target_count;
++}
++
++static int ggml_backend_sched_evm_streaming_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
++    if (!getenv("EVM_CPU_BACKING") || !getenv("EVM_CUDA_STREAMING")) {
++        return -1;
++    }
++    if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || !ggml_backend_sched_evm_streaming_src(node, node->src[0])) {
++        return -1;
++    }
++    for (int b = 0; b < sched->n_backends - 1; ++b) {
++        if (ggml_backend_supports_op(sched->backends[b], node)) {
++            return b;
++        }
++    }
++    return -1;
++}
++
+ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
+     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
+         *node_backend_id = cur_backend_id;
+@@ -1349,6 +1390,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     }
+                 }
+ 
++                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) &&
++                    ggml_backend_sched_evm_streaming_src(node, src)) {
++                    continue;
++                }
++
+                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                     // create a copy of the input in the split's backend
+                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+-- 
+2.43.0.windows.1
+

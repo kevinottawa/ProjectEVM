@@ -1,0 +1,4 @@
+model,scope,domains,runs,valid_runs,split,source_format,pack_cards,confidence_high,confidence_medium,confidence_low
+Qwen1.5-MoE,all domains,26,26,26,calibration,evm-mri-domain-library-v2,108,87,879,474
+DeepSeek-Coder-V2-Lite,stratified portability sample,6,6,6,calibration,evm-mri-domain-library-v2,28,0,369,1295
+Qwen2-57B-A14B,stratified portability sample,6,6,6,calibration,evm-mri-domain-library-v2,28,1,540,1251

@@ -1,0 +1,8 @@
+record_type,model,mode,capacity_slots,generation_tps,hit_rate_pct,bytes_transferred_mb,valid
+offline_cross_validation,Qwen2-57B-A14B,LRU,32,,78.92,,
+offline_cross_validation,Qwen2-57B-A14B,Learned3to17,32,,80.53,,
+offline_cross_validation,Qwen2-57B-A14B,Oracle,32,,84.16,,
+runtime_smoke,Qwen1.5-MoE,GPU page table,32,16.0,59.08,12862.01,True
+runtime_smoke,Qwen1.5-MoE,GPU scheduler,32,15.0,57.65,13315.33,True
+runtime_smoke,DeepSeek-Coder-V2-Lite,GPU page table,32,17.2,71.46,15684.28,True
+runtime_smoke,DeepSeek-Coder-V2-Lite,GPU scheduler,32,14.1,71.75,15544.89,True

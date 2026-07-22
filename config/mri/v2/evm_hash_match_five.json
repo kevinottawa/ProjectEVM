@@ -1,0 +1,11 @@
+{
+  "format": "evm-hash-match-v1",
+  "description": "Five deterministic checks used to compare full-model and exact EVM token streams.",
+  "tasks": [
+    {"id": "arithmetic", "domain": "mathematics", "prompt": "Answer only: 17 * 6 =", "pattern": "\\b102\\b"},
+    {"id": "geography", "domain": "factual_recall", "prompt": "Answer only: the capital of Canada is", "pattern": "ottawa"},
+    {"id": "networking", "domain": "systems", "prompt": "Answer in one sentence: TCP is reliable and UDP is", "pattern": "unreliable|connectionless"},
+    {"id": "code", "domain": "programming", "prompt": "Write only a Python expression that is true when integer n is even.", "pattern": "n.*%.*2"},
+    {"id": "rate", "domain": "reasoning", "prompt": "Answer only: 150 km divided by 3 hours equals", "pattern": "\\b50\\b"}
+  ]
+}

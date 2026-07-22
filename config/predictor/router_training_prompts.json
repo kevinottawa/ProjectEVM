@@ -1,0 +1,29 @@
+{
+  "format": "evm-router-training-prompts-v1",
+  "prompts": [
+    "Explain cache locality in two concise sentences.",
+    "What is 17 multiplied by 6? Answer only with the number.",
+    "Explain the difference between TCP and UDP.",
+    "Write a Python function that tests whether an integer is even.",
+    "Describe a safe database migration plan.",
+    "Explain binary search time complexity.",
+    "Give three causes of a cache miss.",
+    "Summarize what a mixture-of-experts model does.",
+    "Explain how asynchronous memory copies work.",
+    "What is the capital of Canada?",
+    "Solve 3x + 5 = 20.",
+    "Describe how to review a pull request.",
+    "Return JSON with enabled set to true and name set to evm.",
+    "Explain why null pointer dereference is unsafe.",
+    "Describe a simple REST API error response.",
+    "Write pseudocode for breadth first search.",
+    "Explain the difference between RAM and VRAM.",
+    "Give a concise plan for debugging a failing test.",
+    "Explain what a mutex protects.",
+    "Describe a reliable benchmark methodology.",
+    "What is the chemical formula for water?",
+    "Explain the purpose of a KV cache in language-model inference.",
+    "Write a SQL query parameterization safety rule.",
+    "Explain why deterministic sampling helps benchmark reproducibility."
+  ]
+}

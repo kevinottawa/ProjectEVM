@@ -1,0 +1,6 @@
+experts_per_tensor,generation_tps,peak_gpu_memory_mb,peak_process_rss_mb,cache_hit_rate_pct,bytes_transferred_mb,pagefile_used_delta_mb,status
+8,0.4,9146,4762,32.08,59167.09,0,PASS
+16,0.5,12896,4787,48.85,44609.41,0,PASS
+24,0.5,16459,4742,58.81,35960.86,0,PASS
+32,0.6,19894,4742,64.84,30706.96,0,PASS
+40,0.6,23530,4739,70.42,25834.51,0,PASS

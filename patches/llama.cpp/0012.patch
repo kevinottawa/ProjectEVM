@@ -1,0 +1,629 @@
+From e9615f24958177549905ae5cd7ec10a4449ba763 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 21:37:07 -0400
+Subject: [PATCH 12/26] Add exact external expert vault loader
+
+---
+ examples/CMakeLists.txt                       |   1 +
+ examples/evm-vault-parity/CMakeLists.txt      |   8 +
+ .../evm-vault-parity/evm-vault-parity.cpp     |  94 ++++++++++
+ .../routing-observatory.cpp                   |  25 ++-
+ ggml/src/ggml-backend.cpp                     |   3 +-
+ ggml/src/ggml-cuda/evm.cuh                    | 177 +++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   2 +-
+ src/llama-model-loader.cpp                    | 116 ++++++++++++
+ 8 files changed, 414 insertions(+), 12 deletions(-)
+ create mode 100644 examples/evm-vault-parity/CMakeLists.txt
+ create mode 100644 examples/evm-vault-parity/evm-vault-parity.cpp
+
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 9d1f448f3..be53d8a98 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -42,4 +42,5 @@ else()
+         endif()
+     endif()
+     add_subdirectory(routing-observatory)
++    add_subdirectory(evm-vault-parity)
+ endif()
+diff --git a/examples/evm-vault-parity/CMakeLists.txt b/examples/evm-vault-parity/CMakeLists.txt
+new file mode 100644
+index 000000000..c2b031fdd
+--- /dev/null
++++ b/examples/evm-vault-parity/CMakeLists.txt
+@@ -0,0 +1,8 @@
++set(TARGET llama-evm-vault-parity)
++add_executable(${TARGET} evm-vault-parity.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
++if(TARGET BUILD_INFO)
++  add_dependencies(${TARGET} BUILD_INFO)
++endif()
+diff --git a/examples/evm-vault-parity/evm-vault-parity.cpp b/examples/evm-vault-parity/evm-vault-parity.cpp
+new file mode 100644
+index 000000000..c160d6388
+--- /dev/null
++++ b/examples/evm-vault-parity/evm-vault-parity.cpp
+@@ -0,0 +1,94 @@
++#include "llama.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static bool get_value(int argc, char ** argv, const char * flag, std::string & value) {
++    for (int i = 1; i + 1 < argc; ++i) {
++        if (std::strcmp(argv[i], flag) == 0) {
++            value = argv[i + 1];
++            return true;
++        }
++    }
++    return false;
++}
++
++static uint64_t fnv1a_token(uint64_t hash, llama_token token) {
++    const uint32_t value = static_cast<uint32_t>(token);
++    for (int byte = 0; byte < 4; ++byte) {
++        hash ^= (value >> (byte * 8)) & 0xffU;
++        hash *= 1099511628211ULL;
++    }
++    return hash;
++}
++
++int main(int argc, char ** argv) {
++    std::string model_path;
++    std::string prompt = "EVM exact vault parity probe.";
++    std::string value;
++    int n_predict = 8;
++    int n_ctx = 256;
++    int n_gpu_layers = 99;
++
++    if (!get_value(argc, argv, "-m", model_path)) {
++        std::fprintf(stderr, "missing -m model.gguf\n");
++        return 2;
++    }
++    if (get_value(argc, argv, "-p", value)) prompt = value;
++    if (get_value(argc, argv, "-n", value)) n_predict = std::stoi(value);
++    if (get_value(argc, argv, "-c", value)) n_ctx = std::stoi(value);
++    if (get_value(argc, argv, "-ngl", value)) n_gpu_layers = std::stoi(value);
++
++    llama_backend_init();
++    llama_model_params model_params = llama_model_default_params();
++    model_params.n_gpu_layers = n_gpu_layers;
++    llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
++    if (!model) return 3;
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
++    if (n_prompt <= 0 || n_prompt + n_predict > n_ctx) return 4;
++    std::vector<llama_token> tokens(n_prompt);
++    if (llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()), tokens.data(), n_prompt, true, true) < 0) return 5;
++
++    llama_context_params context_params = llama_context_default_params();
++    context_params.n_ctx = n_ctx;
++    context_params.n_batch = 1;
++    context_params.no_perf = true;
++    llama_context * context = llama_init_from_model(model, context_params);
++    if (!context) return 6;
++
++    auto sampler_params = llama_sampler_chain_default_params();
++    sampler_params.no_perf = true;
++    llama_sampler * sampler = llama_sampler_chain_init(sampler_params);
++    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
++
++    for (llama_token prompt_token : tokens) {
++        llama_batch prompt_batch = llama_batch_get_one(&prompt_token, 1);
++        if (llama_decode(context, prompt_batch) != 0) return 7;
++    }
++
++    llama_token first_token = llama_sampler_sample(sampler, context, -1);
++    llama_batch batch = llama_batch_get_one(&first_token, 1);
++    uint64_t fingerprint = 1469598103934665603ULL;
++    int generated = 0;
++    for (int step = 0; step < n_predict; ++step) {
++        llama_token token = step == 0 ? first_token : llama_sampler_sample(sampler, context, -1);
++        if (llama_vocab_is_eog(vocab, token)) break;
++        fingerprint = fnv1a_token(fingerprint, token);
++        llama_sampler_accept(sampler, token);
++        batch = llama_batch_get_one(&token, 1);
++        ++generated;
++        if (step + 1 < n_predict && llama_decode(context, batch) != 0) break;
++    }
++
++    std::printf("{\"tokens_generated\":%d,\"token_fingerprint_fnv1a64\":\"%016llx\"}\n", generated, static_cast<unsigned long long>(fingerprint));
++    llama_sampler_free(sampler);
++    llama_free(context);
++    llama_model_free(model);
++    llama_backend_free();
++    return generated == n_predict ? 0 : 7;
++}
+diff --git a/examples/routing-observatory/routing-observatory.cpp b/examples/routing-observatory/routing-observatory.cpp
+index 81784c75b..34a525457 100644
+--- a/examples/routing-observatory/routing-observatory.cpp
++++ b/examples/routing-observatory/routing-observatory.cpp
+@@ -1,13 +1,16 @@
+ #include "arg.h"
+ #include "common.h"
+ #include "llama.h"
++#include "sampling.h"
+ #include <cstdio>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+ struct observatory_data {
+     FILE * out_file;
+     int prompt_id;
++    int token_base;
+ };
+ 
+ static bool observatory_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+@@ -33,7 +36,7 @@ static bool observatory_cb_eval(struct ggml_tensor * t, bool ask, void * user_da
+         int n_tokens = t->ne[1];
+         
+         for (int tok = 0; tok < n_tokens; tok++) {
+-            fprintf(obs->out_file, "{\"prompt_id\": %d, \"layer_id\": %d, \"token_idx\": %d, \"probs\": [", obs->prompt_id, il, tok);
++            fprintf(obs->out_file, "{\"prompt_id\": %d, \"layer_id\": %d, \"token_idx\": %d, \"probs\": [", obs->prompt_id, il, obs->token_base + tok);
+             for (int e = 0; e < n_expert; e++) {
+                 fprintf(obs->out_file, "%f%s", probs[tok * n_expert + e], (e == n_expert - 1) ? "" : ", ");
+             }
+@@ -54,9 +57,11 @@ int main(int argc, char ** argv) {
+ 
+     observatory_data obs;
+     obs.prompt_id = params.sampling.seed; // passing prompt_id via seed parameter for simplicity
++    obs.token_base = 0;
+     
+     // We append so that running over multiple prompts concatenates the logs
+-    obs.out_file = fopen("routing_trace.jsonl", "a");
++    const char * output_path = std::getenv("EVM_ROUTING_TRACE_PATH");
++    obs.out_file = fopen(output_path ? output_path : "routing_trace.jsonl", "a");
+     if (!obs.out_file) {
+         fprintf(stderr, "Failed to open routing_trace.jsonl\n");
+         return 1;
+@@ -81,6 +86,22 @@ int main(int argc, char ** argv) {
+         fprintf(stderr, "Decode failed\n");
+         return 1;
+     }
++
++    struct common_sampler * sampler = common_sampler_init(model, params.sampling);
++    for (int generated = 0; generated < params.n_predict; ++generated) {
++        const llama_token token = common_sampler_sample(sampler, ctx, -1, true);
++        if (llama_vocab_is_eog(llama_model_get_vocab(model), token)) break;
++        common_sampler_accept(sampler, token, true);
++        obs.token_base = static_cast<int>(tokens.size()) + generated;
++        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(&token), 1))) {
++            fprintf(stderr, "Generation decode failed\n");
++            common_sampler_free(sampler);
++            fclose(obs.out_file);
++            llama_backend_free();
++            return 1;
++        }
++    }
++    common_sampler_free(sampler);
+     
+     fclose(obs.out_file);
+     llama_backend_free();
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 3534389a4..42d56d777 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1019,7 +1019,8 @@ static bool ggml_backend_sched_evm_streaming_src(const struct ggml_tensor * node
+     if (node == nullptr || src == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[0] != src) {
+         return false;
+     }
+-    if (src->buffer == nullptr || src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_backend_buffer_is_host(src->buffer)) {
++    const bool vault_virtual = getenv("EVM_EXPERT_VAULT_INDEX") != nullptr && src->buffer == nullptr;
++    if (!vault_virtual && (src->buffer == nullptr || src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_backend_buffer_is_host(src->buffer))) {
+         return false;
+     }
+     int target_count = 0;
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 4016fc235..2d006c227 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -12,9 +12,154 @@
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ 
+ namespace EVM {
+ 
++struct VaultSlice {
++    uint64_t offset = 0;
++    size_t bytes = 0;
++};
++
++class VaultRegistry {
++private:
++    bool attempted = false;
++    bool available = false;
++    std::unordered_map<std::string, std::vector<VaultSlice>> slices;
++#if defined(_WIN32)
++    HANDLE file = INVALID_HANDLE_VALUE;
++    HANDLE mapping = nullptr;
++    char * base = nullptr;
++    uint64_t size = 0;
++#endif
++
++    void load() {
++        attempted = true;
++        const char * index_path = getenv("EVM_EXPERT_VAULT_INDEX");
++        const char * pack_path = getenv("EVM_EXPERT_VAULT_PACK");
++        if (!index_path || !*index_path || !pack_path || !*pack_path) {
++            return;
++        }
++#if !defined(_WIN32)
++        fprintf(stderr, "EVM: external expert vault is currently implemented for Windows builds only\n");
++        return;
++#else
++        std::ifstream index(index_path);
++        if (!index) {
++            fprintf(stderr, "EVM: unable to open expert vault index: %s\n", index_path);
++            return;
++        }
++        std::string line;
++        while (std::getline(index, line)) {
++            if (line.empty() || line[0] == '#') {
++                continue;
++            }
++            std::istringstream fields(line);
++            std::string tensor;
++            std::string text;
++            if (!std::getline(fields, tensor, '\t') || !std::getline(fields, text, '\t')) {
++                fprintf(stderr, "EVM: malformed expert vault index\n");
++                return;
++            }
++            const int expert = std::stoi(text);
++            if (!std::getline(fields, text, '\t')) return;
++            const uint64_t offset = std::stoull(text);
++            if (!std::getline(fields, text, '\t')) return;
++            const size_t bytes = (size_t) std::stoull(text);
++            if (expert < 0) {
++                fprintf(stderr, "EVM: invalid expert ID in vault index\n");
++                return;
++            }
++            auto & tensor_slices = slices[tensor];
++            if (tensor_slices.size() <= (size_t) expert) {
++                tensor_slices.resize((size_t) expert + 1);
++            }
++            if (tensor_slices[expert].bytes != 0) {
++                fprintf(stderr, "EVM: duplicate expert vault index entry for %s/%d\n", tensor.c_str(), expert);
++                return;
++            }
++            tensor_slices[expert] = { offset, bytes };
++        }
++        file = CreateFileA(pack_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++        if (file == INVALID_HANDLE_VALUE) {
++            fprintf(stderr, "EVM: unable to open expert vault pack: %s\n", pack_path);
++            return;
++        }
++        LARGE_INTEGER pack_size{};
++        if (!GetFileSizeEx(file, &pack_size)) {
++            fprintf(stderr, "EVM: unable to read expert vault pack size\n");
++            return;
++        }
++        size = (uint64_t) pack_size.QuadPart;
++        mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
++        if (!mapping) {
++            fprintf(stderr, "EVM: unable to map expert vault pack\n");
++            return;
++        }
++        base = (char *) MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
++        if (!base) {
++            fprintf(stderr, "EVM: unable to view expert vault pack\n");
++            return;
++        }
++        available = true;
++        fprintf(stderr, "EVM: external expert vault active: tensors=%zu, pack=%.2f GB\n",
++                slices.size(), (double) size / (1024.0 * 1024.0 * 1024.0));
++#endif
++    }
++
++public:
++    ~VaultRegistry() {
++#if defined(_WIN32)
++        if (base) UnmapViewOfFile(base);
++        if (mapping) CloseHandle(mapping);
++        if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
++#endif
++    }
++
++    bool has_tensor(const char * tensor, int expert_count, size_t bytes_per_expert) {
++        if (!attempted) load();
++        if (!available) return false;
++        const auto it = slices.find(tensor);
++        if (it == slices.end() || it->second.size() != (size_t) expert_count) return false;
++        for (const VaultSlice & slice : it->second) {
++            if (slice.bytes != bytes_per_expert || slice.offset > size || slice.bytes > size - slice.offset) return false;
++        }
++        return true;
++    }
++
++    const char * expert_data(const std::string & tensor, int expert, size_t bytes_per_expert) {
++        const auto it = slices.find(tensor);
++        if (!available || it == slices.end() || expert < 0 || (size_t) expert >= it->second.size()) {
++            fprintf(stderr, "EVM: missing external expert vault slice for %s/%d\n", tensor.c_str(), expert);
++            abort();
++        }
++        const VaultSlice & slice = it->second[(size_t) expert];
++        if (slice.bytes != bytes_per_expert || slice.offset > size || slice.bytes > size - slice.offset) {
++            fprintf(stderr, "EVM: invalid external expert vault slice for %s/%d\n", tensor.c_str(), expert);
++            abort();
++        }
++#if defined(_WIN32)
++        return base + slice.offset;
++#else
++        return nullptr;
++#endif
++    }
++};
++
++inline VaultRegistry & vault_registry() {
++    static VaultRegistry registry;
++    return registry;
++}
++
+ struct PinnedStageSlot {
+     char * data = nullptr;
+     cudaEvent_t ready = nullptr;
+@@ -88,6 +233,8 @@ private:
+     bool physical_ids_event_recorded[2] = {false, false};
+     int physical_ids_stage_index = 0;
+     bool source_on_device = false;
++    bool source_from_vault = false;
++    std::string vault_tensor_name;
+     
+     cudaStream_t stream;
+     cudaEvent_t event;
+@@ -226,7 +373,7 @@ public:
+     }
+ 
+ public:
+-    void init(int num_experts_capacity, int bytes_per_expert, char* original_d_ptr, int num_total_experts) {
++    void init(int num_experts_capacity, int bytes_per_expert, char* original_d_ptr, int num_total_experts, const char * tensor_name) {
+         std::lock_guard<std::mutex> lock(mtx);
+         if (initialized) return;
+         
+@@ -271,8 +418,14 @@ public:
+         ensure_physical_ids_capacity_locked((int) read_env_ll("EVM_ID_BUFFER_CAPACITY", 65536));
+ 
+         h_experts_mmap = original_d_ptr;
++        vault_tensor_name = tensor_name;
++        source_from_vault = getenv("EVM_EXPERT_VAULT_INDEX") != nullptr;
++        if (source_from_vault && !vault_registry().has_tensor(tensor_name, total_experts, (size_t) expert_size_bytes)) {
++            fprintf(stderr, "EVM: expert vault is missing or incompatible with tensor %s\n", tensor_name);
++            abort();
++        }
+         cudaPointerAttributes attr;
+-        cudaError_t attr_status = cudaPointerGetAttributes(&attr, original_d_ptr);
++        cudaError_t attr_status = source_from_vault ? cudaErrorInvalidValue : cudaPointerGetAttributes(&attr, original_d_ptr);
+         if (attr_status == cudaSuccess) {
+ #if CUDART_VERSION >= 10000
+             source_on_device = attr.type == cudaMemoryTypeDevice;
+@@ -295,6 +448,10 @@ public:
+         
+         initialized = true;
+ 
++        if (source_from_vault) {
++            fprintf(stderr, "EVM: tensor %s is backed by the external expert vault\n", tensor_name);
++        }
++
+         if (pool_mb > 0 || reserve_mb > 0 || strict_budget) {
+             fprintf(stderr,
+                     "EVM: budget controls active: requested_capacity=%d, budget_max_capacity=%d, "
+@@ -394,17 +551,19 @@ public:
+                 
+                 slots[phys_idx].logical_expert_id = log_id;
+                 
+-                size_t offset = (size_t)log_id * expert_size_bytes;
+                 size_t dst_offset = (size_t)phys_idx * expert_size_bytes;
++                const char * source = source_from_vault
++                    ? vault_registry().expert_data(vault_tensor_name, log_id, (size_t) expert_size_bytes)
++                    : h_experts_mmap + (size_t) log_id * expert_size_bytes;
+                 
+                 if (source_on_device || !staged_h2d_copy(
+                         d_pool + dst_offset,
+-                        h_experts_mmap + offset,
++                        source,
+                         (size_t) expert_size_bytes,
+                         stream)) {
+                     CUDA_CHECK(cudaMemcpyAsync(
+                         d_pool + dst_offset,
+-                        h_experts_mmap + offset,
++                        source,
+                         expert_size_bytes,
+                         source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+                         stream));
+@@ -511,17 +670,19 @@ public:
+ 
+             slots[phys_idx].logical_expert_id = log_id;
+ 
+-            const size_t offset = (size_t) log_id * expert_size_bytes;
+             const size_t dst_offset = (size_t) phys_idx * expert_size_bytes;
++            const char * source = source_from_vault
++                ? vault_registry().expert_data(vault_tensor_name, log_id, (size_t) expert_size_bytes)
++                : h_experts_mmap + (size_t) log_id * expert_size_bytes;
+ 
+             if (source_on_device || !staged_h2d_copy(
+                     d_pool + dst_offset,
+-                    h_experts_mmap + offset,
++                    source,
+                     (size_t) expert_size_bytes,
+                     stream)) {
+                 CUDA_CHECK(cudaMemcpyAsync(
+                     d_pool + dst_offset,
+-                    h_experts_mmap + offset,
++                    source,
+                     expert_size_bytes,
+                     source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+                     stream));
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 83fd0c978..46a196a1d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1811,7 +1811,7 @@ static EVM::Manager * ggml_cuda_evm_get_or_init_manager(const ggml_tensor * src0
+     if (!mgr->is_initialized()) {
+         const int total_experts = src0->ne[2];
+         const int expert_size = src0->nb[2];
+-        mgr->init(ggml_cuda_evm_capacity_for_total(total_experts), expert_size, (char *) src0->data, total_experts);
++        mgr->init(ggml_cuda_evm_capacity_for_total(total_experts), expert_size, (char *) src0->data, total_experts, src0->name);
+     }
+     return mgr;
+ }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 55554735d..4b8b2ad1d 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -10,13 +10,88 @@
+ #include <cinttypes>
+ #include <cstdint>
+ #include <cstring>
++#include <fstream>
+ #include <future>
++#include <mutex>
+ #include <regex>
++#include <sstream>
++#include <unordered_map>
+ 
+ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+ static const size_t GiB = 1024*MiB;
+ 
++struct evm_vault_tensor_meta {
++    ggml_type type;
++    std::array<int64_t, GGML_MAX_DIMS> ne;
++};
++
++static const std::unordered_map<std::string, evm_vault_tensor_meta> & evm_vault_tensor_metadata() {
++    static std::once_flag once;
++    static std::unordered_map<std::string, evm_vault_tensor_meta> metadata;
++    std::call_once(once, [] {
++        const char * index_path = getenv("EVM_EXPERT_VAULT_INDEX");
++        if (!index_path || !*index_path) {
++            return;
++        }
++        std::ifstream index(index_path);
++        if (!index) {
++            throw std::runtime_error(format("unable to open EVM expert vault index: %s", index_path));
++        }
++        std::string line;
++        while (std::getline(index, line)) {
++            if (line.empty() || line[0] == '#') {
++                continue;
++            }
++            std::istringstream fields(line);
++            std::string name;
++            std::string expert;
++            std::string offset;
++            std::string bytes;
++            std::string type_text;
++            if (!std::getline(fields, name, '\t') ||
++                !std::getline(fields, expert, '\t') ||
++                !std::getline(fields, offset, '\t') ||
++                !std::getline(fields, bytes, '\t') ||
++                !std::getline(fields, type_text, '\t')) {
++                throw std::runtime_error(format("malformed EVM expert vault index row: %s", line.c_str()));
++            }
++            const int type = std::stoi(type_text);
++            if (type < 0 || type >= GGML_TYPE_COUNT) {
++                throw std::runtime_error(format("invalid GGML type in EVM expert vault index: %d", type));
++            }
++            evm_vault_tensor_meta entry{ static_cast<ggml_type>(type), { 1, 1, 1, 1 } };
++            std::string dim;
++            for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
++                if (!std::getline(fields, dim, i + 1 == GGML_MAX_DIMS ? '\n' : '\t')) {
++                    throw std::runtime_error(format("missing EVM expert tensor dimension for %s", name.c_str()));
++                }
++                entry.ne[i] = std::stoll(dim);
++                if (entry.ne[i] < 1) {
++                    throw std::runtime_error(format("invalid EVM expert tensor dimension for %s", name.c_str()));
++                }
++            }
++            const auto [it, inserted] = metadata.emplace(name, entry);
++            if (!inserted && (it->second.type != entry.type || it->second.ne != entry.ne)) {
++                throw std::runtime_error(format("inconsistent EVM expert vault metadata for %s", name.c_str()));
++            }
++        }
++        if (metadata.empty()) {
++            throw std::runtime_error("EVM expert vault index contains no expert tensors");
++        }
++    });
++    return metadata;
++}
++
++static const evm_vault_tensor_meta * evm_vault_find_tensor_meta(const std::string & name) {
++    if (getenv("EVM_EXPERT_VAULT_INDEX") == nullptr) {
++        return nullptr;
++    }
++    const auto & metadata = evm_vault_tensor_metadata();
++    const auto it = metadata.find(name);
++    return it == metadata.end() ? nullptr : &it->second;
++}
++
+ const char * llama_file_version_name(llama_fver version) {
+     switch (version) {
+         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
+@@ -1217,6 +1292,47 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return buft;
+     };
+ 
++    if (const auto * vault_meta = evm_vault_find_tensor_meta(tn.str())) {
++        if (getenv("EVM_CUDA_STREAMING") == nullptr || getenv("EVM_CPU_BACKING") == nullptr) {
++            throw std::runtime_error("EVM expert vault requires EVM_CPU_BACKING=1 and EVM_CUDA_STREAMING=1");
++        }
++        if (ne.size() > GGML_MAX_DIMS) {
++            throw std::runtime_error(format("too many dimensions for EVM expert vault tensor %s", tn.str().c_str()));
++        }
++        for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
++            const int64_t expected = dim < ne.size() ? ne.begin()[dim] : 1;
++            if (expected != vault_meta->ne[dim]) {
++                throw std::runtime_error(format("EVM expert vault tensor %s has wrong shape", tn.str().c_str()));
++            }
++        }
++
++        ggml_tensor t_meta{};
++        t_meta.type = vault_meta->type;
++        for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
++            t_meta.ne[dim] = vault_meta->ne[dim];
++        }
++        t_meta.nb[0] = ggml_type_size(t_meta.type);
++        t_meta.nb[1] = t_meta.nb[0] * (t_meta.ne[0] / ggml_blck_size(t_meta.type));
++        for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
++            t_meta.nb[dim] = t_meta.nb[dim - 1] * t_meta.ne[dim - 1];
++        }
++        ggml_set_name(&t_meta, tn.str().c_str());
++
++        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
++        GGML_ASSERT(buft != nullptr);
++        ggml_context * ctx = ctx_for_buft(buft);
++        ggml_tensor * tensor = ggml_new_tensor(ctx, vault_meta->type, (int) ne.size(), ne.begin());
++        ggml_set_name(tensor, tn.str().c_str());
++
++        // A non-null sentinel keeps the model allocator from reserving the full
++        // expert tensor. CUDA EVM replaces this source before any expert kernel.
++        static uint8_t virtual_expert_sentinel = 0;
++        tensor->data = &virtual_expert_sentinel;
++        n_tensors++;
++        n_created++;
++        return tensor;
++    }
++
+     if (files.empty()) {
+         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
+             return nullptr;
+-- 
+2.43.0.windows.1
+

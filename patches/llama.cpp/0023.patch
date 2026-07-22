@@ -1,0 +1,227 @@
+From eefee7208a84868e1213bb06d14779f6284b4229 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Tue, 14 Jul 2026 09:16:33 -0400
+Subject: [PATCH 23/26] Add conservative router score prefetch
+
+---
+ ggml/src/ggml-cuda/evm.cuh      | 95 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 33 ++++++++++++
+ 2 files changed, 128 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index fa89178f0..050434119 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -402,6 +402,9 @@ public:
+     uint64_t metric_gpu_page_hits = 0;
+     uint64_t metric_gpu_page_misses = 0;
+     uint64_t metric_gpu_page_attempts = 0;
++    uint64_t metric_router_score_prefetches = 0;
++    uint64_t metric_router_score_bridge_attempts = 0;
++    uint64_t metric_router_score_bridge_captures = 0;
+ 
+ public:
+     Manager() {}
+@@ -421,6 +424,8 @@ public:
+                 fprintf(stderr, "GPU Page Hits    : %llu\n", (unsigned long long) metric_gpu_page_hits);
+                 fprintf(stderr, "GPU Page Misses  : %llu\n", (unsigned long long) metric_gpu_page_misses);
+                 fprintf(stderr, "GPU Page Attempts: %llu\n", (unsigned long long) metric_gpu_page_attempts);
++                fprintf(stderr, "Router Score Prefetches: %llu\n", (unsigned long long) metric_router_score_prefetches);
++                fprintf(stderr, "Router Score Bridge: %llu/%llu\n", (unsigned long long) metric_router_score_bridge_captures, (unsigned long long) metric_router_score_bridge_attempts);
+                 fflush(stderr);
+             }
+             if (const char * profile_path = getenv("EVM_ROUTING_PROFILE_PATH")) {
+@@ -620,6 +625,66 @@ public:
+         last_routed_experts = current_ids;
+     }
+ 
++    // This is intentionally conservative. The router-score bridge may fill
++    // only unused pool slots, so it cannot overwrite an expert the current
++    // CUDA kernel could still read. The copy remains asynchronous with respect
++    // to current expert compute and becomes available to the next token.
++    void queue_router_score_prefetch_locked(
++            const float * scores,
++            int score_count,
++            const std::unordered_set<int> & current_ids) {
++        if (read_env_ll("EVM_ROUTER_SCORE_PREFETCH", 0) == 0 ||
++                ability_pack_only || gpu_page_table_enabled() || !scores || score_count != total_experts) {
++            return;
++        }
++        const int budget = std::max(0, std::min(4, (int) read_env_ll("EVM_ROUTER_SCORE_PREFETCH_COUNT", 1)));
++        const float minimum = (float) read_env_ll("EVM_ROUTER_SCORE_PREFETCH_MIN_PPM", 0) / 1000000.0f;
++        if (budget == 0) return;
++
++        std::vector<int> candidates;
++        candidates.reserve((size_t) total_experts);
++        for (int expert = 0; expert < total_experts; ++expert) {
++            if (scores[expert] >= minimum && cache_map.find(expert) == cache_map.end() &&
++                    current_ids.find(expert) == current_ids.end() && pinned_experts.find(expert) == pinned_experts.end()) {
++                candidates.push_back(expert);
++            }
++        }
++        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) { return scores[a] > scores[b]; });
++
++        int queued = 0;
++        for (const int candidate : candidates) {
++            if (queued >= budget) break;
++            const auto empty = std::find_if(slots.begin(), slots.end(), [](const CacheSlot & slot) {
++                return slot.logical_expert_id < 0;
++            });
++            if (empty == slots.end()) break;
++            const int physical = empty->physical_index;
++            empty->logical_expert_id = candidate;
++            const char * source = source_from_vault
++                ? vault_registry().expert_data(vault_tensor_name, candidate, (size_t) expert_size_bytes)
++                : h_experts_mmap + (size_t) candidate * expert_size_bytes;
++            const size_t offset = (size_t) physical * expert_size_bytes;
++            if (source_on_device || !staged_h2d_copy(d_pool + offset, source, (size_t) expert_size_bytes, stream)) {
++                CUDA_CHECK(cudaMemcpyAsync(
++                    d_pool + offset, source, expert_size_bytes,
++                    source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, stream));
++            }
++            lru_list.remove(physical);
++            lru_list.push_back(physical);
++            auto it = lru_list.end();
++            --it;
++            cache_map[candidate] = it;
++            prefetched_experts.insert(candidate);
++            if (metrics_enabled) {
++                metric_bytes_transferred += expert_size_bytes;
++                metric_predictor_prefetches++;
++                metric_router_score_prefetches++;
++            }
++            ++queued;
++        }
++        if (queued > 0) sync_gpu_page_table_locked();
++    }
++
+     void preload_ability_experts() {
+         if (!ability_enabled) return;
+         const size_t required = ability_experts.size() + (ability_pack_only ? 0 : 1);
+@@ -1217,6 +1282,22 @@ public:
+         metric_gpu_page_attempts++;
+     }
+ 
++    void queue_router_score_prefetch(const std::vector<float> & scores, const int * logical_ids, int count) {
++        if (scores.empty() || !logical_ids || count <= 0) return;
++        std::lock_guard<std::mutex> lock(mtx);
++        std::unordered_set<int> current_ids;
++        for (int i = 0; i < count; ++i) {
++            if (logical_ids[i] >= 0 && logical_ids[i] < total_experts) current_ids.insert(logical_ids[i]);
++        }
++        queue_router_score_prefetch_locked(scores.data(), (int) scores.size(), current_ids);
++    }
++
++    void note_router_score_bridge(bool captured) {
++        std::lock_guard<std::mutex> lock(mtx);
++        metric_router_score_bridge_attempts++;
++        if (captured) metric_router_score_bridge_captures++;
++    }
++
+     void write_profile(std::ofstream & profile, const char * prompt_id, const char * phase) {
+         std::lock_guard<std::mutex> lock(mtx);
+         profile << "{\"prompt_id\":\"" << prompt_id << "\",\"phase\":\"" << phase
+@@ -1241,6 +1322,9 @@ public:
+         metric_gpu_page_hits = 0;
+         metric_gpu_page_misses = 0;
+         metric_gpu_page_attempts = 0;
++        metric_router_score_prefetches = 0;
++        metric_router_score_bridge_attempts = 0;
++        metric_router_score_bridge_captures = 0;
+         prefetched_experts.clear();
+         last_routed_experts.clear();
+         if (read_env_ll("EVM_PREDICTOR_PERSIST", 0) == 0) {
+@@ -1275,6 +1359,9 @@ inline void print_all_stats() {
+     uint64_t total_gpu_page_hits = 0;
+     uint64_t total_gpu_page_misses = 0;
+     uint64_t total_gpu_page_attempts = 0;
++    uint64_t total_router_score_prefetches = 0;
++    uint64_t total_router_score_bridge_attempts = 0;
++    uint64_t total_router_score_bridge_captures = 0;
+ 
+     for (auto& pair : managers) {
+         if (!pair.second) continue;
+@@ -1288,6 +1375,9 @@ inline void print_all_stats() {
+         total_gpu_page_hits += pair.second->metric_gpu_page_hits;
+         total_gpu_page_misses += pair.second->metric_gpu_page_misses;
+         total_gpu_page_attempts += pair.second->metric_gpu_page_attempts;
++        total_router_score_prefetches += pair.second->metric_router_score_prefetches;
++        total_router_score_bridge_attempts += pair.second->metric_router_score_bridge_attempts;
++        total_router_score_bridge_captures += pair.second->metric_router_score_bridge_captures;
+     }
+ 
+     const uint64_t total = total_hits + total_misses;
+@@ -1307,6 +1397,8 @@ inline void print_all_stats() {
+     fprintf(stderr, "GPU Page Hits    : %llu\n", (unsigned long long) total_gpu_page_hits);
+     fprintf(stderr, "GPU Page Misses  : %llu\n", (unsigned long long) total_gpu_page_misses);
+     fprintf(stderr, "GPU Page Attempts: %llu\n", (unsigned long long) total_gpu_page_attempts);
++    fprintf(stderr, "Router Score Prefetches: %llu\n", (unsigned long long) total_router_score_prefetches);
++    fprintf(stderr, "Router Score Bridge: %llu/%llu\n", (unsigned long long) total_router_score_bridge_captures, (unsigned long long) total_router_score_bridge_attempts);
+ 
+     // Clear counters so later explicit calls and manager destructors do not double-report.
+     for (auto& pair : managers) {
+@@ -1321,6 +1413,9 @@ inline void print_all_stats() {
+         pair.second->metric_gpu_page_hits = 0;
+         pair.second->metric_gpu_page_misses = 0;
+         pair.second->metric_gpu_page_attempts = 0;
++        pair.second->metric_router_score_prefetches = 0;
++        pair.second->metric_router_score_bridge_attempts = 0;
++        pair.second->metric_router_score_bridge_captures = 0;
+     }
+     fflush(stderr);
+ }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4a7aa9051..452d3b220 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1835,6 +1835,33 @@ static std::vector<int> ggml_cuda_evm_copy_ids_to_host(
+     return h_ids;
+ }
+ 
++static std::vector<float> ggml_cuda_evm_copy_router_scores_to_host(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * ids,
++        int total_experts) {
++    if (getenv("EVM_ROUTER_SCORE_PREFETCH") == nullptr || atoi(getenv("EVM_ROUTER_SCORE_PREFETCH")) == 0) {
++        return {};
++    }
++    const ggml_tensor * scores = ids ? ids->src[0] : nullptr;
++    while (scores && (scores->op == GGML_OP_VIEW || scores->op == GGML_OP_RESHAPE ||
++            scores->op == GGML_OP_CONT || scores->op == GGML_OP_ARGSORT)) {
++        scores = scores->src[0];
++    }
++    if (!scores || scores->type != GGML_TYPE_F32 || scores->ne[0] != total_experts || scores->ne[1] <= 0 || !scores->data) {
++        return {};
++    }
++    std::vector<float> h_scores((size_t) total_experts);
++    const int64_t row = scores->ne[1] - 1;
++    CUDA_CHECK(cudaMemcpyAsync(
++        h_scores.data(),
++        (const char *) scores->data + (size_t) row * scores->nb[1],
++        (size_t) total_experts * sizeof(float),
++        cudaMemcpyDeviceToHost,
++        ctx.stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    return h_scores;
++}
++
+ // Cache-hit remapping is a tiny GPU operation.  The output is contiguous even
+ // when the logical ID view has a row stride, matching the replacement view
+ // used by mul_mat_id below.  A 64-bit activity mask is enough for the current
+@@ -1975,7 +2002,13 @@ static bool ggml_cuda_evm_remap_mul_mat_id(
+     count = (int) (ids->ne[0] * ids->ne[1]);
+     if (!ggml_cuda_evm_try_gpu_page_remap(ctx, ids, mgr, count)) {
+         std::vector<int> h_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
++        const std::vector<int> logical_ids = h_ids;
++        const std::vector<float> router_scores = ggml_cuda_evm_copy_router_scores_to_host(ctx, ids, mgr->get_total_experts());
++        if (getenv("EVM_ROUTER_SCORE_PREFETCH") != nullptr && atoi(getenv("EVM_ROUTER_SCORE_PREFETCH")) != 0) {
++            mgr->note_router_score_bridge(!router_scores.empty());
++        }
+         mgr->ensure_experts(h_ids.data(), count, ctx.stream());
++        mgr->queue_router_score_prefetch(router_scores, logical_ids.data(), count);
+     }
+ 
+     ggml_cuda_evm_rewrite_ids_view(ids, mgr, ids_copy, ids);
+-- 
+2.43.0.windows.1
+

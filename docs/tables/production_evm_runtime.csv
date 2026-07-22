@@ -1,0 +1,5 @@
+mode,backing,generation_tps,peak_gpu_memory_mb,peak_process_rss_mb,peak_process_private_mb,system_ram_used_delta_mb,pagefile_used_delta_mb,trials,status
+Native max-GPU,WDDM/shared,6.3,23951,24025,34079,24902,5,1,PASS
+CPU-backed,Committed RAM,3.9,5485,23719,34327,24152,4192,1,PASS
+RAM unified 8,Committed RAM,1.9,9116,24115,37838,24616,5092,1,PASS
+Disk unified 8,Lazy GGUF mmap,0.4,9146,4762,9089,4807,0,3,PASS

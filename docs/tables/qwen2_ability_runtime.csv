@@ -1,0 +1,5 @@
+name,pack_size,pack_only,capacity,trials,valid_trials,mean_generation_tps,stddev_generation_tps,mean_peak_vram_mb,mean_peak_rss_mb,mean_hit_rate_pct,mean_substitutions,pass,resident_expert_pct
+pack16_exact,16,False,24,3,3,0.83,0.12,16320,23033,66.1,0,True,25.0
+pack24_exact,24,False,32,3,3,1.0,0.36,19764,23918,76.86,0,True,37.5
+pack16_only,16,True,16,3,3,24.97,5.76,12688,12015,100.0,8882,True,25.0
+pack24_only,24,True,24,3,3,38.67,13.66,16300,15574,100.0,6146,True,37.5

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="EVM research: short-horizon working-set residency for Mixture-of-Experts inference.">
+  <title>EVM: Expert Virtual Memory</title>
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="wordmark" href="index.html">EVM <span>Research</span></a>
+    <nav aria-label="Primary navigation">
+      <a href="#results">Results</a>
+      <a href="#evidence">Evidence</a>
+      <a href="#artifacts">Artifacts</a>
+      <a href="paper.html">Paper</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="eyebrow">Research prototype by Kevin Price</div>
+      <h1>Expert weights as a moving GPU working set.</h1>
+      <p class="lede">EVM explores whether Mixture-of-Experts inference can exchange fixed full-model expert residency for a bounded, short-horizon CUDA expert pool while preserving the router's original choices.</p>
+      <div class="button-row">
+        <a class="button" href="paper.html">Read the paper</a>
+        <a class="button secondary" href="EVM_Paper.md">View Markdown source</a>
+        <a class="button secondary" href="LLAMA_CPP_INTEGRATION.md">Patch and build guide</a>
+      </div>
+    </section>
+
+    <section class="band" id="results">
+      <div class="section">
+        <div class="eyebrow">Validated results</div>
+        <h2>What the prototype shows</h2>
+        <div class="results-grid">
+          <article class="result-card">
+            <div class="result-number">3 / 17</div>
+            <h3>Token reuse window</h3>
+            <p>Median expert reuse is 3 tokens; the 95th percentile is 17 tokens across the sanitized routing trace.</p>
+          </article>
+          <article class="result-card">
+            <div class="result-number">6.2-18.8 GB</div>
+            <h3>Peak VRAM returned</h3>
+            <p>CPU-backed EVM reduced sampled GPU memory across the three tested MoE models.</p>
+          </article>
+          <article class="result-card">
+            <div class="result-number">0 MB</div>
+            <h3>Page-file growth</h3>
+            <p>Disk-backed exact-eight EVM demonstrated targeted loading without full-model RAM or page-file residency.</p>
+          </article>
+        </div>
+        <p class="callout"><strong>Boundary:</strong> the disk-backed path is a memory proof, not a production-throughput claim. Static GPU packs are fast and compact but change the model and must independently pass quality gates.</p>
+      </div>
+    </section>
+
+    <section class="section" id="evidence">
+      <div class="eyebrow">Evidence at a glance</div>
+      <h2>Read the curves, not just the claim</h2>
+      <div class="figure-grid">
+        <figure>
+          <a href="figures/final_proof/steady_state_small_model_residency.png"><img src="figures/final_proof/steady_state_small_model_residency.png" alt="Small-model steady-state EVM residency evidence"></a>
+          <figcaption>Measured steady-state residency on Qwen1.5-MoE and DeepSeek-Coder-V2-Lite.</figcaption>
+        </figure>
+        <figure>
+          <a href="figures/final_proof/gpu_scheduler_final_evidence.png"><img src="figures/final_proof/gpu_scheduler_final_evidence.png" alt="GPU scheduler final evidence"></a>
+          <figcaption>GPU scheduler evidence and the remaining runtime boundary.</figcaption>
+        </figure>
+        <figure>
+          <a href="figures/production_evm/layer_aware_predictor_hit_rate.png"><img src="figures/production_evm/layer_aware_predictor_hit_rate.png" alt="Layer-aware predictor hit rates"></a>
+          <figcaption>Held-out predictor performance relative to LRU and the Oracle ceiling.</figcaption>
+        </figure>
+        <figure>
+          <a href="figures/final_workflow/evm_max_context_summary.png"><img src="figures/final_workflow/evm_max_context_summary.png" alt="Maximum context VRAM summary"></a>
+          <figcaption>How returned expert VRAM can be used for context and KV-cache headroom.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="band" id="artifacts">
+      <div class="section">
+        <div class="eyebrow">Reproducibility</div>
+        <h2>Publication artifacts</h2>
+        <div class="artifact-grid">
+          <article class="artifact-card">
+            <h3>Paper and data</h3>
+            <p><a href="EVM_Paper.md">Canonical paper</a>, curated <a href="tables/">tables</a>, and sanitized <a href="../data/">routing telemetry</a>.</p>
+          </article>
+          <article class="artifact-card">
+            <h3>Runtime prototype</h3>
+            <p>The exact 26-commit <a href="../patches/llama.cpp/">llama.cpp patch series</a> and its recorded upstream base.</p>
+          </article>
+          <article class="artifact-card">
+            <h3>MRI workflow</h3>
+            <p><a href="MoE_MRI_Workflow.md">Offline MoE MRI</a>, versioned diagnostic payloads, and quality-gated static-pack procedures.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">EVM publication prototype by Kevin Price. Paper and figures: CC BY 4.0. Code: MIT.</footer>
+</body>
+</html>

@@ -1,0 +1,546 @@
+From 91af71c6cffdc1ed537294f0a3e3ad561a91516f Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Thu, 9 Jul 2026 22:15:05 -0400
+Subject: [PATCH 07/26] Add fusion-aware EVM remapping
+
+---
+ ggml/src/ggml-cuda/evm.cuh      | 124 ++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 322 ++++++++++++++++++++++----------
+ 2 files changed, 350 insertions(+), 96 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 1a19a1671..740434b5b 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -336,6 +336,130 @@ public:
+             cudaStreamWaitEvent(compute_stream, event, 0);
+         }
+     }
++
++    void ensure_experts_with_fixed_mapping(
++            const int * logical_ids,
++            int * physical_ids,
++            int count,
++            const std::unordered_map<int, int> & logical_to_physical,
++            cudaStream_t compute_stream) {
++        if (!is_initialized()) return;
++        std::lock_guard<std::mutex> lock(mtx);
++
++        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
++
++        if ((int) logical_to_physical.size() > capacity) {
++            resize_pool_locked((int) logical_to_physical.size());
++        }
++
++        bool needs_sync = false;
++        ensure_physical_ids_capacity_locked(count);
++
++        for (const auto & pair : logical_to_physical) {
++            const int log_id = pair.first;
++            const int phys_idx = pair.second;
++
++            if (log_id < 0 || log_id >= total_experts) {
++                fprintf(stderr,
++                        "EVM: invalid logical expert id %d for tensor with %d experts\n",
++                        log_id, total_experts);
++                abort();
++            }
++            if (phys_idx < 0 || phys_idx >= capacity) {
++                fprintf(stderr,
++                        "EVM: invalid fixed physical expert id %d for capacity %d\n",
++                        phys_idx, capacity);
++                abort();
++            }
++
++            if (slots[phys_idx].logical_expert_id == log_id) {
++                metric_cache_hits++;
++                continue;
++            }
++
++            metric_cache_misses++;
++
++            const int old_log_at_phys = slots[phys_idx].logical_expert_id;
++            if (old_log_at_phys != -1) {
++                metric_evictions++;
++            }
++
++            for (auto & slot : slots) {
++                if (slot.physical_index != phys_idx && slot.logical_expert_id == log_id) {
++                    slot.logical_expert_id = -1;
++                    break;
++                }
++            }
++
++            slots[phys_idx].logical_expert_id = log_id;
++
++            const size_t offset = (size_t) log_id * expert_size_bytes;
++            const size_t dst_offset = (size_t) phys_idx * expert_size_bytes;
++
++            CUDA_CHECK(cudaMemcpyAsync(
++                d_pool + dst_offset,
++                h_experts_mmap + offset,
++                expert_size_bytes,
++                source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
++                stream));
++            metric_bytes_transferred += expert_size_bytes;
++            needs_sync = true;
++        }
++
++        cache_map.clear();
++        lru_list.clear();
++        std::unordered_set<int> mapped_phys;
++        for (const auto & pair : logical_to_physical) {
++            mapped_phys.insert(pair.second);
++        }
++        for (const auto & pair : logical_to_physical) {
++            const int phys_idx = pair.second;
++            lru_list.push_front(phys_idx);
++            cache_map[slots[phys_idx].logical_expert_id] = lru_list.begin();
++        }
++        for (const auto & slot : slots) {
++            if (mapped_phys.find(slot.physical_index) != mapped_phys.end()) {
++                continue;
++            }
++            lru_list.push_back(slot.physical_index);
++            if (slot.logical_expert_id != -1) {
++                auto it = lru_list.end();
++                --it;
++                cache_map[slot.logical_expert_id] = it;
++            }
++        }
++
++        int min_physical = capacity;
++        int max_physical = -1;
++        for (int i = 0; i < count; ++i) {
++            const int log_id = logical_ids[i];
++            if (log_id < 0) {
++                physical_ids[i] = log_id;
++                continue;
++            }
++            auto it = logical_to_physical.find(log_id);
++            if (it == logical_to_physical.end()) {
++                fprintf(stderr, "EVM: missing fixed mapping for logical expert id %d\n", log_id);
++                abort();
++            }
++            physical_ids[i] = it->second;
++            min_physical = std::min(min_physical, physical_ids[i]);
++            max_physical = std::max(max_physical, physical_ids[i]);
++        }
++        if (getenv("EVM_DEBUG")) {
++            fprintf(stderr,
++                    "EVM: fixed-remapped %d ids to physical range [%d,%d] capacity=%d unique=%zu\n",
++                    count, min_physical, max_physical, capacity, logical_to_physical.size());
++        }
++
++        CUDA_CHECK(cudaMemcpy(d_physical_ids, physical_ids, count * sizeof(int), cudaMemcpyHostToDevice));
++        needs_sync = true;
++
++        if (needs_sync) {
++            cudaEventRecord(event, stream);
++            cudaStreamWaitEvent(compute_stream, event, 0);
++        }
++    }
+     
+     char* get_pool() { return d_pool; }
+     int* get_physical_ids() { return d_physical_ids; }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9baff5eeb..44cebd2c2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1755,112 +1755,218 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
+ 
+-static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-    const ggml_tensor * src0 = dst->src[0];
+-    const ggml_tensor * src1 = dst->src[1];
+-    const ggml_tensor * ids  = dst->src[2];
++static bool ggml_cuda_evm_is_active() {
++    return getenv("EVM_DISABLE") == nullptr &&
++        (getenv("EVM_CPU_BACKING") != nullptr || getenv("EVM_CUDA_STREAMING") != nullptr || getenv("EVM_CAPACITY_PCT") != nullptr);
++}
+ 
+-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
++static bool ggml_cuda_evm_fusion_aware_enabled() {
++    const char * env = getenv("EVM_FUSION_AWARE");
++    return env != nullptr && std::atoi(env) != 0;
++}
+ 
+-    ggml_tensor ids_copy;
+-    ggml_tensor src0_copy;
+-    bool evm_remapped = false;
++static int ggml_cuda_evm_capacity_for_total(int total_experts) {
++    int capacity_pct = 100;
++    const char * env_pct = getenv("EVM_CAPACITY_PCT");
++    if (env_pct) {
++        capacity_pct = atoi(env_pct);
++        if (capacity_pct < 1) capacity_pct = 1;
++        if (capacity_pct > 100) capacity_pct = 100;
++    }
++    return std::max(1, (total_experts * capacity_pct) / 100);
++}
+ 
+-    // EVM Interception: Check if this is an MoE layer
++static bool ggml_cuda_evm_tensor_eligible(const ggml_tensor * src0, const ggml_tensor * ids) {
+     static int ignore_count = -1;
+     static int target_count = -1;
+     if (ignore_count == -1) {
+-        if (getenv("EVM_IGNORE_EXPERT_COUNT")) {
+-            ignore_count = atoi(getenv("EVM_IGNORE_EXPERT_COUNT"));
+-        } else {
+-            ignore_count = 0;
+-        }
++        ignore_count = getenv("EVM_IGNORE_EXPERT_COUNT") ? atoi(getenv("EVM_IGNORE_EXPERT_COUNT")) : 0;
+     }
+     if (target_count == -1) {
+-        if (getenv("EVM_TARGET_EXPERT_COUNT")) {
+-            target_count = atoi(getenv("EVM_TARGET_EXPERT_COUNT"));
+-        } else {
+-            target_count = 0;
+-        }
++        target_count = getenv("EVM_TARGET_EXPERT_COUNT") ? atoi(getenv("EVM_TARGET_EXPERT_COUNT")) : 0;
+     }
+ 
+-    bool evm_eligible = ids && src0->ne[2] > 1 && !getenv("EVM_DISABLE");
++    bool evm_eligible = ids && src0 && src0->ne[2] > 1 && !getenv("EVM_DISABLE");
+     if (evm_eligible && target_count > 0) {
+         evm_eligible = src0->ne[2] == target_count;
+     } else if (evm_eligible && ignore_count > 0) {
+         evm_eligible = src0->ne[2] != ignore_count;
+     }
++    return evm_eligible;
++}
+ 
+-    if (evm_eligible) {
+-        if (getenv("EVM_DEBUG")) {
+-            fprintf(stderr, "EVM: intercepting mul_mat_id experts=%lld ids=[%lld,%lld]\n",
+-                    (long long) src0->ne[2],
+-                    ids ? (long long) ids->ne[0] : 0,
+-                    ids ? (long long) ids->ne[1] : 0);
+-            fprintf(stderr,
+-                    "EVM: src0 name=%s type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ids nb=[%zu,%zu,%zu,%zu]\n",
+-                    src0->name,
+-                    (int) src0->type,
+-                    (long long) src0->ne[0],
+-                    (long long) src0->ne[1],
+-                    (long long) src0->ne[2],
+-                    (long long) src0->ne[3],
+-                    src0->nb[0],
+-                    src0->nb[1],
+-                    src0->nb[2],
+-                    src0->nb[3],
+-                    ids->nb[0],
+-                    ids->nb[1],
+-                    ids->nb[2],
+-                    ids->nb[3]);
+-        }
+-        EVM::Manager* mgr = EVM::get_manager(src0);
+-        if (!mgr->is_initialized()) {
+-            int total_experts = src0->ne[2];
+-            int expert_size = src0->nb[2];
+-            
+-            // Read capacity from environment variable (percentage 1-100)
+-            int capacity_pct = 100; // default 100%
+-            const char* env_pct = getenv("EVM_CAPACITY_PCT");
+-            if (env_pct) {
+-                capacity_pct = atoi(env_pct);
+-                if (capacity_pct < 1) capacity_pct = 1;
+-                if (capacity_pct > 100) capacity_pct = 100;
+-            }
+-            int capacity = (total_experts * capacity_pct) / 100;
+-            if (capacity < 1) capacity = 1;
+-            
+-            mgr->init(capacity, expert_size, (char*)src0->data, total_experts);
+-        }
+-        
+-        size_t count = ids->ne[0] * ids->ne[1];
+-        std::vector<int> h_ids(count);
+-        if (ids->nb[1] == ids->ne[0] * sizeof(int)) {
+-            CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, count * sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
+-        } else {
+-            CUDA_CHECK(cudaMemcpy2DAsync(h_ids.data(), ids->ne[0] * sizeof(int), ids->data, ids->nb[1], ids->ne[0] * sizeof(int), ids->ne[1], cudaMemcpyDeviceToHost, ctx.stream()));
+-        }
+-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+-        
+-        mgr->update_phase(ids->ne[1]);
+-        mgr->ensure_experts(h_ids.data(), count, ctx.stream());
+-        
+-        // Shallow copy tensors to avoid race conditions with concurrent GGML nodes
+-        ids_copy = *ids;
+-        ids_copy.data = mgr->get_physical_ids();
+-        ids_copy.nb[1] = ids_copy.nb[0] * ids_copy.ne[0];
+-        ids_copy.nb[2] = ids_copy.nb[1] * ids_copy.ne[1];
+-        ids_copy.nb[3] = ids_copy.nb[2] * ids_copy.ne[2];
+-        ids = &ids_copy;
+-
+-        src0_copy = *src0;
+-        src0_copy.data = mgr->get_pool();
+-        src0_copy.buffer = nullptr;
+-        src0_copy.ne[2] = mgr->get_capacity();
+-        src0 = &src0_copy;
+-        evm_remapped = true;
++static EVM::Manager * ggml_cuda_evm_get_or_init_manager(const ggml_tensor * src0) {
++    EVM::Manager * mgr = EVM::get_manager(src0);
++    if (!mgr->is_initialized()) {
++        const int total_experts = src0->ne[2];
++        const int expert_size = src0->nb[2];
++        mgr->init(ggml_cuda_evm_capacity_for_total(total_experts), expert_size, (char *) src0->data, total_experts);
++    }
++    return mgr;
++}
++
++static std::vector<int> ggml_cuda_evm_copy_ids_to_host(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * ids,
++        int & count) {
++    count = (int) (ids->ne[0] * ids->ne[1]);
++    std::vector<int> h_ids(count);
++    if (ids->nb[1] == ids->ne[0] * (int64_t) sizeof(int)) {
++        CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, (size_t) count * sizeof(int), cudaMemcpyDeviceToHost, ctx.stream()));
++    } else {
++        CUDA_CHECK(cudaMemcpy2DAsync(
++                h_ids.data(), ids->ne[0] * sizeof(int),
++                ids->data, ids->nb[1],
++                ids->ne[0] * sizeof(int), ids->ne[1],
++                cudaMemcpyDeviceToHost, ctx.stream()));
++    }
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    return h_ids;
++}
++
++static void ggml_cuda_evm_rewrite_tensor_views(
++        const ggml_tensor * original_src0,
++        EVM::Manager * mgr,
++        ggml_tensor & src0_copy,
++        const ggml_tensor *& src0) {
++    src0_copy = *original_src0;
++    src0_copy.data = mgr->get_pool();
++    src0_copy.buffer = nullptr;
++    src0_copy.ne[2] = mgr->get_capacity();
++    src0 = &src0_copy;
++}
++
++static void ggml_cuda_evm_rewrite_ids_view(
++        const ggml_tensor * original_ids,
++        EVM::Manager * mgr,
++        ggml_tensor & ids_copy,
++        const ggml_tensor *& ids) {
++    ids_copy = *original_ids;
++    ids_copy.data = mgr->get_physical_ids();
++    ids_copy.nb[1] = ids_copy.nb[0] * ids_copy.ne[0];
++    ids_copy.nb[2] = ids_copy.nb[1] * ids_copy.ne[1];
++    ids_copy.nb[3] = ids_copy.nb[2] * ids_copy.ne[2];
++    ids = &ids_copy;
++}
++
++static bool ggml_cuda_evm_remap_mul_mat_id(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor *& src0,
++        const ggml_tensor *& ids,
++        ggml_tensor & src0_copy,
++        ggml_tensor & ids_copy) {
++    if (!ggml_cuda_evm_tensor_eligible(src0, ids)) {
++        return false;
++    }
++
++    if (getenv("EVM_DEBUG")) {
++        fprintf(stderr, "EVM: intercepting mul_mat_id experts=%lld ids=[%lld,%lld]\n",
++                (long long) src0->ne[2],
++                ids ? (long long) ids->ne[0] : 0,
++                ids ? (long long) ids->ne[1] : 0);
++        fprintf(stderr,
++                "EVM: src0 name=%s type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ids nb=[%zu,%zu,%zu,%zu]\n",
++                src0->name,
++                (int) src0->type,
++                (long long) src0->ne[0],
++                (long long) src0->ne[1],
++                (long long) src0->ne[2],
++                (long long) src0->ne[3],
++                src0->nb[0],
++                src0->nb[1],
++                src0->nb[2],
++                src0->nb[3],
++                ids->nb[0],
++                ids->nb[1],
++                ids->nb[2],
++                ids->nb[3]);
++    }
++
++    EVM::Manager * mgr = ggml_cuda_evm_get_or_init_manager(src0);
++
++    int count = 0;
++    std::vector<int> h_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
++
++    mgr->update_phase(ids->ne[1]);
++    mgr->ensure_experts(h_ids.data(), count, ctx.stream());
++
++    ggml_cuda_evm_rewrite_ids_view(ids, mgr, ids_copy, ids);
++    ggml_cuda_evm_rewrite_tensor_views(src0, mgr, src0_copy, src0);
++    return true;
++}
++
++static bool ggml_cuda_evm_remap_fused_mul_mat_id(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor *& up_src0,
++        const ggml_tensor *& gate_src0,
++        const ggml_tensor *& ids,
++        ggml_tensor & up_src0_copy,
++        ggml_tensor & gate_src0_copy,
++        ggml_tensor & ids_copy) {
++    if (!ggml_cuda_evm_fusion_aware_enabled()) {
++        return false;
++    }
++    if (!ggml_cuda_evm_tensor_eligible(up_src0, ids) || !ggml_cuda_evm_tensor_eligible(gate_src0, ids)) {
++        return false;
++    }
++    if (up_src0->ne[2] != gate_src0->ne[2]) {
++        fprintf(stderr, "EVM: fused remap requires gate/up tensors to expose the same logical expert count\n");
++        return false;
++    }
++
++    EVM::Manager * up_mgr = ggml_cuda_evm_get_or_init_manager(up_src0);
++    EVM::Manager * gate_mgr = ggml_cuda_evm_get_or_init_manager(gate_src0);
++
++    int count = 0;
++    std::vector<int> logical_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
++
++    up_mgr->update_phase(ids->ne[1]);
++    gate_mgr->update_phase(ids->ne[1]);
++
++    std::unordered_map<int, int> logical_to_physical;
++    logical_to_physical.reserve((size_t) count);
++    for (int i = 0; i < count; ++i) {
++        const int log_id = logical_ids[i];
++        if (log_id < 0) {
++            continue;
++        }
++        if (logical_to_physical.find(log_id) == logical_to_physical.end()) {
++            const int phys_idx = (int) logical_to_physical.size();
++            logical_to_physical.emplace(log_id, phys_idx);
++        }
++    }
++
++    std::vector<int> up_physical_ids(count);
++    std::vector<int> gate_physical_ids(count);
++    up_mgr->ensure_experts_with_fixed_mapping(logical_ids.data(), up_physical_ids.data(), count, logical_to_physical, ctx.stream());
++    gate_mgr->ensure_experts_with_fixed_mapping(logical_ids.data(), gate_physical_ids.data(), count, logical_to_physical, ctx.stream());
++
++    ggml_cuda_evm_rewrite_ids_view(ids, up_mgr, ids_copy, ids);
++    ggml_cuda_evm_rewrite_tensor_views(up_src0, up_mgr, up_src0_copy, up_src0);
++    ggml_cuda_evm_rewrite_tensor_views(gate_src0, gate_mgr, gate_src0_copy, gate_src0);
++
++    if (getenv("EVM_DEBUG")) {
++        fprintf(stderr,
++                "EVM: fused remap gate/up experts=%lld unique=%zu capacity(up/gate)=%d/%d\n",
++                (long long) up_src0_copy.ne[2],
++                logical_to_physical.size(),
++                up_mgr->get_capacity(),
++                gate_mgr->get_capacity());
+     }
++    return true;
++}
++
++static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids  = dst->src[2];
++
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
++
++    ggml_tensor ids_copy;
++    ggml_tensor src0_copy;
++    bool evm_remapped = ggml_cuda_evm_remap_mul_mat_id(ctx, src0, ids, src0_copy, ids_copy);
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -3157,9 +3263,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+-    static bool disable_fusion_for_evm = getenv("EVM_DISABLE") == nullptr &&
+-        (getenv("EVM_CPU_BACKING") != nullptr || getenv("EVM_CUDA_STREAMING") != nullptr || getenv("EVM_CAPACITY_PCT") != nullptr);
+-    if (disable_fusion || disable_fusion_for_evm) {
++    const bool evm_active = ggml_cuda_evm_is_active();
++    if (disable_fusion || (evm_active && !ggml_cuda_evm_fusion_aware_enabled())) {
+         return 0;
+     }
+ 
+@@ -3395,10 +3500,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src0 = up_n->src[0];
+             const ggml_tensor * src1 = up_n->src[1];
+             const ggml_tensor * ids  = up_n->src[2];
++            const ggml_tensor * gate_src0 = gate_n->src[0];
++            ggml_tensor up_src0_copy;
++            ggml_tensor gate_src0_copy;
++            ggml_tensor ids_copy;
++
++            if (op == GGML_OP_MUL_MAT_ID && evm_active &&
++                    !ggml_cuda_evm_remap_fused_mul_mat_id(*cuda_ctx, src0, gate_src0, ids, up_src0_copy, gate_src0_copy, ids_copy)) {
++                continue;
++            }
+ 
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+-                fusion_data.gate      = gate_n->src[0];
++                fusion_data.gate      = gate_src0;
+                 fusion_data.x_bias    = up_bias_tensor;
+                 fusion_data.gate_bias = gate_bias_tensor;
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+@@ -3411,7 +3525,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+             if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+-                fusion_data.gate      = gate_n->src[0];
++                fusion_data.gate      = gate_src0;
+                 fusion_data.x_bias    = up_bias_tensor;
+                 fusion_data.gate_bias = gate_bias_tensor;
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+@@ -3436,10 +3550,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src0 = up->src[0];
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
++            const ggml_tensor * gate_src0 = gate->src[0];
++            ggml_tensor up_src0_copy;
++            ggml_tensor gate_src0_copy;
++            ggml_tensor ids_copy;
++
++            if (op == GGML_OP_MUL_MAT_ID && evm_active &&
++                    !ggml_cuda_evm_remap_fused_mul_mat_id(*cuda_ctx, src0, gate_src0, ids, up_src0_copy, gate_src0_copy, ids_copy)) {
++                continue;
++            }
+ 
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+-                fusion_data.gate   = gate->src[0];
++                fusion_data.gate   = gate_src0;
+                 fusion_data.glu_op = ggml_get_glu_op(glu);
+ 
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+@@ -3450,7 +3573,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+-                fusion_data.gate   = gate->src[0];
++                fusion_data.gate   = gate_src0;
+                 fusion_data.glu_op = ggml_get_glu_op(glu);
+ 
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+@@ -3507,6 +3630,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             continue;
+         }
+ 
++        ggml_tensor src0_copy;
++        ggml_tensor ids_copy;
++        if (op == GGML_OP_MUL_MAT_ID && evm_active &&
++                !ggml_cuda_evm_remap_mul_mat_id(*cuda_ctx, src0, ids, src0_copy, ids_copy)) {
++            continue;
++        }
++
+         ggml_cuda_mm_fusion_args_host fusion_data{};
+         fusion_data.x_bias = bias_tensor;
+ 
+-- 
+2.43.0.windows.1
+

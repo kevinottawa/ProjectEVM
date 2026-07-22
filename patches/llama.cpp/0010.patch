@@ -1,0 +1,71 @@
+From 185434d4e2bd018de623b902b2c66c416d658221 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 09:42:48 -0400
+Subject: [PATCH 10/26] Add lazy disk-backed EVM residency
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++++++++++++
+ src/llama-model.cpp             |  6 +++++-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 44cebd2c2..c8b7e4241 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -89,6 +89,13 @@
+ #include <string>
+ #include <vector>
+ 
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+ #define GGML_LOG_WARN_ONCE(str) \
+@@ -3977,6 +3984,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++#if defined(_WIN32)
++    if (getenv("EVM_DISK_BACKING") && getenv("EVM_DISK_TRIM")) {
++        static std::atomic<uint64_t> trim_counter{0};
++        static const uint64_t trim_interval = [] {
++            const char * value = getenv("EVM_DISK_TRIM_INTERVAL");
++            return value ? std::max<uint64_t>(1, strtoull(value, nullptr, 10)) : 1;
++        }();
++        if ((trim_counter.fetch_add(1, std::memory_order_relaxed) + 1) % trim_interval == 0) {
++            auto trim_working_set = [](void *) {
++                SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
++            };
++            CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), trim_working_set, nullptr));
++        }
++    }
++#endif
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 26f4693e3..5f7e4bfb4 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1503,7 +1503,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    const bool evm_disk_backing = getenv("EVM_DISK_BACKING") != nullptr;
++    ml.init_mappings(!evm_disk_backing, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    if (evm_disk_backing) {
++        LLAMA_LOG_INFO("%s: EVM disk backing active; whole-model mmap prefetch disabled\n", __func__);
++    }
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+-- 
+2.43.0.windows.1
+

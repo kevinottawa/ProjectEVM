@@ -1,0 +1,48 @@
+{
+  "format": "evm-mri-diagnostic-suite-v1",
+  "description": "Fixed positive and contrast prompts used to assign evidence-backed expert associations.",
+  "domains": {
+    "general_explanation": {
+      "description": "Plain-language explanation and summarization",
+      "prompts": [
+        "Explain cache locality in plain language.",
+        "Summarize why reproducible testing matters."
+      ]
+    },
+    "software_coding": {
+      "description": "Programming implementation and debugging",
+      "prompts": [
+        "Write a compact C++ binary search function.",
+        "Explain how to debug a null pointer in C++."
+      ]
+    },
+    "formal_reasoning": {
+      "description": "Arithmetic and symbolic deduction",
+      "prompts": [
+        "Solve 3x + 5 = 20 and explain the steps.",
+        "If all A are B and no B are C, can any A be C?"
+      ]
+    },
+    "science_factual": {
+      "description": "Scientific facts and causal explanation",
+      "prompts": [
+        "Explain why ice floats on liquid water.",
+        "State the chemical formula for water and identify its elements."
+      ]
+    },
+    "creative_language": {
+      "description": "Narrative and figurative language",
+      "prompts": [
+        "Write a four-line story about a city during a power outage.",
+        "Give one literal and one metaphorical description of moonlight."
+      ]
+    },
+    "instruction_safety": {
+      "description": "Constraint following and benign refusal behavior",
+      "prompts": [
+        "Reply with exactly three words describing careful engineering.",
+        "Politely refuse to invent a citation and suggest verification."
+      ]
+    }
+  }
+}

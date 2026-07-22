@@ -1,0 +1,9 @@
+model,capacity_pct,method,baseline_passed,total,passed,retained_baseline_passes,baseline_opportunities,decision
+qwen1,50.0,frequency,9,12,6,6,9,NO-GO
+qwen1,50.0,core_overlay,9,12,6,6,9,NO-GO
+qwen1,75.0,frequency,9,12,8,8,9,NO-GO
+qwen1,75.0,core_overlay,9,12,7,7,9,NO-GO
+deepseek,50.0,frequency,8,12,4,4,8,NO-GO
+deepseek,50.0,core_overlay,8,12,2,2,8,NO-GO
+deepseek,75.0,frequency,8,12,7,7,8,NO-GO
+deepseek,75.0,core_overlay,8,12,4,4,8,NO-GO

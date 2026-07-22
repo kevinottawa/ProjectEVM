@@ -1,0 +1,13 @@
+model,resident_expert_pct,experts_per_layer,mode,trials,valid_trials,mean_generation_tps,stddev_generation_tps,mean_peak_vram_mb,mean_peak_rss_mb,mean_hit_rate_pct,mean_substitutions,pass
+Qwen1.5-MoE,25.0,15,exact_fallback,3,3,6.43,3.46,4293,6489,55.51,0,True
+Qwen1.5-MoE,25.0,15,pack_only,3,3,40.23,21.7,3475,2780,100.0,6224,True
+Qwen1.5-MoE,37.5,23,exact_fallback,3,3,22.83,7.39,5157,6462,68.48,0,True
+Qwen1.5-MoE,37.5,23,pack_only,3,3,53.03,25.59,4293,3598,100.0,4432,True
+DeepSeek-Coder-V2-Lite,25.0,16,exact_fallback,3,3,3.73,2.2,5251,7791,67.28,0,True
+DeepSeek-Coder-V2-Lite,25.0,16,pack_only,3,3,54.6,4.34,4143,3360,100.0,6208,True
+DeepSeek-Coder-V2-Lite,37.5,24,exact_fallback,3,3,15.73,2.82,6363,7796,77.6,0,True
+DeepSeek-Coder-V2-Lite,37.5,24,pack_only,3,3,57.03,0.4,5251,4495,100.0,3933,True
+Qwen2-57B-A14B,25.0,16,exact_fallback,3,3,0.83,0.12,16320,23033,66.1,0,True
+Qwen2-57B-A14B,37.5,24,exact_fallback,3,3,1.0,0.36,19764,23918,76.86,0,True
+Qwen2-57B-A14B,25.0,16,pack_only,3,3,24.97,5.76,12688,12015,100.0,8882,True
+Qwen2-57B-A14B,37.5,24,pack_only,3,3,38.67,13.66,16300,15574,100.0,6146,True

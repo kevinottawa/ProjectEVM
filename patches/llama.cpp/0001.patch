@@ -1,0 +1,770 @@
+From ec2a42714225dd7ddf3ae2053053079478c62ae8 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Thu, 9 Jul 2026 16:01:18 -0400
+Subject: [PATCH 01/26] Add EVM routing and runtime controls
+
+---
+ .gitignore                                    |   1 +
+ examples/CMakeLists.txt                       |   1 +
+ examples/routing-observatory/CMakeLists.txt   |   8 +
+ .../routing-observatory.cpp                   |  88 +++++
+ ggml/include/ggml-cuda.h                      |   2 +
+ ggml/src/ggml-cuda/evm.cuh                    | 370 ++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 107 ++++-
+ src/llama-graph.cpp                           |   5 +
+ src/llama-model.cpp                           |  17 +
+ tools/cli/cli.cpp                             |   7 +
+ 10 files changed, 591 insertions(+), 15 deletions(-)
+ create mode 100644 examples/routing-observatory/CMakeLists.txt
+ create mode 100644 examples/routing-observatory/routing-observatory.cpp
+ create mode 100644 ggml/src/ggml-cuda/evm.cuh
+
+diff --git a/.gitignore b/.gitignore
+index 9b589615a..9df0a8b39 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -42,6 +42,7 @@
+ # Build Artifacts
+ 
+ /tags
++/routing_trace.jsonl
+ /.build/
+ /build*
+ /release
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d25..9d1f448f3 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -41,4 +41,5 @@ else()
+             add_subdirectory(sycl)
+         endif()
+     endif()
++    add_subdirectory(routing-observatory)
+ endif()
+diff --git a/examples/routing-observatory/CMakeLists.txt b/examples/routing-observatory/CMakeLists.txt
+new file mode 100644
+index 000000000..b2637ddbf
+--- /dev/null
++++ b/examples/routing-observatory/CMakeLists.txt
+@@ -0,0 +1,8 @@
++set(TARGET llama-routing-observatory)
++add_executable(${TARGET} routing-observatory.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
++if(TARGET BUILD_INFO)
++  add_dependencies(${TARGET} BUILD_INFO)
++endif()
+diff --git a/examples/routing-observatory/routing-observatory.cpp b/examples/routing-observatory/routing-observatory.cpp
+new file mode 100644
+index 000000000..81784c75b
+--- /dev/null
++++ b/examples/routing-observatory/routing-observatory.cpp
+@@ -0,0 +1,88 @@
++#include "arg.h"
++#include "common.h"
++#include "llama.h"
++#include <cstdio>
++#include <string>
++#include <vector>
++
++struct observatory_data {
++    FILE * out_file;
++    int prompt_id;
++};
++
++static bool observatory_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
++    if (ask) return true;
++    
++    auto * obs = (observatory_data *) user_data;
++    std::string name = t->name;
++    
++    if (name.find("ffn_moe_probs-") == 0) {
++        // Find layer index
++        int il = std::stoi(name.substr(name.find_last_of('-') + 1));
++        
++        bool is_host = ggml_backend_buffer_is_host(t->buffer);
++        std::vector<uint8_t> data;
++        if (!is_host) {
++            auto n_bytes = ggml_nbytes(t);
++            data.resize(n_bytes);
++            ggml_backend_tensor_get(t, data.data(), 0, n_bytes);
++        }
++        float * probs = is_host ? (float*)t->data : (float*)data.data();
++        
++        int n_expert = t->ne[0];
++        int n_tokens = t->ne[1];
++        
++        for (int tok = 0; tok < n_tokens; tok++) {
++            fprintf(obs->out_file, "{\"prompt_id\": %d, \"layer_id\": %d, \"token_idx\": %d, \"probs\": [", obs->prompt_id, il, tok);
++            for (int e = 0; e < n_expert; e++) {
++                fprintf(obs->out_file, "%f%s", probs[tok * n_expert + e], (e == n_expert - 1) ? "" : ", ");
++            }
++            fprintf(obs->out_file, "]}\n");
++        }
++    }
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    common_params params;
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    observatory_data obs;
++    obs.prompt_id = params.sampling.seed; // passing prompt_id via seed parameter for simplicity
++    
++    // We append so that running over multiple prompts concatenates the logs
++    obs.out_file = fopen("routing_trace.jsonl", "a");
++    if (!obs.out_file) {
++        fprintf(stderr, "Failed to open routing_trace.jsonl\n");
++        return 1;
++    }
++    
++    params.cb_eval = observatory_cb_eval;
++    params.cb_eval_user_data = &obs;
++    params.warmup = false;
++
++    auto llama_init = common_init_from_params(params);
++    auto * model = llama_init->model();
++    auto * ctx   = llama_init->context();
++
++    if (!model || !ctx) {
++        fprintf(stderr, "Failed to load model\n");
++        return 1;
++    }
++
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, true);
++    
++    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
++        fprintf(stderr, "Decode failed\n");
++        return 1;
++    }
++    
++    fclose(obs.out_file);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81eeae..ac31a8220 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -22,6 +22,8 @@ extern "C" {
+ // backend API
+ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
++GGML_BACKEND_API void ggml_backend_cuda_print_evm_stats(void);
++
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
+ // device buffer
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+new file mode 100644
+index 000000000..36246e1e0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -0,0 +1,370 @@
++#pragma once
++
++#include "ggml-cuda.h"
++#include <cuda_runtime.h>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++#include <list>
++#include <mutex>
++#include <cstdio>
++#include <memory>
++#include <algorithm>
++#include <cstdlib>
++
++namespace EVM {
++
++struct CacheSlot {
++    int physical_index;
++    int logical_expert_id;
++};
++
++class Manager {
++private:
++    int capacity = 0;
++    int requested_capacity = 0;
++    int budget_max_capacity = 0;
++    int total_experts = 0;
++    int expert_size_bytes = 0;
++    
++    char* d_pool = nullptr;
++    char* h_experts_mmap = nullptr;
++    int* d_physical_ids = nullptr;
++    bool source_on_device = false;
++    
++    cudaStream_t stream;
++    cudaEvent_t event;
++    
++    std::unordered_map<int, std::list<int>::iterator> cache_map;
++    std::list<int> lru_list;
++    std::vector<CacheSlot> slots;
++    
++    bool initialized = false;
++    bool strict_budget = false;
++    std::mutex mtx;
++
++    static long long read_env_ll(const char * name, long long default_value = 0) {
++        const char * env = getenv(name);
++        if (!env || !*env) {
++            return default_value;
++        }
++        char * end = nullptr;
++        const long long value = strtoll(env, &end, 10);
++        return end == env ? default_value : value;
++    }
++
++public:
++    uint64_t metric_cache_hits = 0;
++    uint64_t metric_cache_misses = 0;
++    uint64_t metric_bytes_transferred = 0;
++    uint64_t metric_evictions = 0;
++
++public:
++    Manager() {}
++    ~Manager() {
++        if (initialized) {
++            uint64_t total = metric_cache_hits + metric_cache_misses;
++            if (total > 0) {
++                fprintf(stderr, "\n[EVM Metrics]\n");
++                fprintf(stderr, "Cache Hits       : %llu\n", (unsigned long long)metric_cache_hits);
++                fprintf(stderr, "Cache Misses     : %llu\n", (unsigned long long)metric_cache_misses);
++                fprintf(stderr, "Evictions        : %llu\n", (unsigned long long)metric_evictions);
++                fprintf(stderr, "Bytes Transferred: %llu (%.2f MB)\n", (unsigned long long)metric_bytes_transferred, (double)metric_bytes_transferred / (1024*1024));
++                fprintf(stderr, "Hit Rate         : %.2f%%\n", 100.0 * metric_cache_hits / total);
++                fflush(stderr);
++            }
++            cudaStreamDestroy(stream);
++            cudaEventDestroy(event);
++        }
++        if (d_pool) cudaFree(d_pool);
++        if (d_physical_ids) cudaFree(d_physical_ids);
++    }
++
++    void reset_cache_state() {
++        cache_map.clear();
++        lru_list.clear();
++        slots.clear();
++        for (int i = 0; i < capacity; ++i) {
++            slots.push_back({i, -1});
++            lru_list.push_front(i);
++        }
++    }
++
++    void resize_pool_locked(int new_capacity) {
++        const int requested = std::max(1, std::min(new_capacity, total_experts));
++        if (strict_budget && budget_max_capacity > 0 && requested > budget_max_capacity) {
++            fprintf(stderr,
++                    "EVM: strict budget exceeded: requested %d experts, budget allows %d. "
++                    "Increase EVM_EXPERT_POOL_MB/EVM_CUDA_FREE_RESERVE_MB or reduce prefill batch size.\n",
++                    requested, budget_max_capacity);
++            abort();
++        }
++
++        new_capacity = requested;
++        if (new_capacity == capacity && d_pool != nullptr) {
++            return;
++        }
++
++        char * new_pool = nullptr;
++        CUDA_CHECK(cudaMalloc(&new_pool, (size_t)new_capacity * expert_size_bytes));
++        if (d_pool) {
++            cudaFree(d_pool);
++        }
++        d_pool = new_pool;
++        capacity = new_capacity;
++        reset_cache_state();
++    }
++
++public:
++    void init(int num_experts_capacity, int bytes_per_expert, char* original_d_ptr, int num_total_experts) {
++        std::lock_guard<std::mutex> lock(mtx);
++        if (initialized) return;
++        
++        total_experts = num_total_experts;
++        expert_size_bytes = bytes_per_expert;
++        strict_budget = read_env_ll("EVM_STRICT_BUDGET", 0) != 0;
++
++        budget_max_capacity = total_experts;
++        const long long pool_mb = read_env_ll("EVM_EXPERT_POOL_MB", 0);
++        if (pool_mb > 0) {
++            const long long pool_bytes = pool_mb * 1024LL * 1024LL;
++            const int cap_by_pool = (int) (pool_bytes / std::max(1, expert_size_bytes));
++            budget_max_capacity = std::max(1, std::min(budget_max_capacity, cap_by_pool));
++        }
++
++        const long long reserve_mb = read_env_ll("EVM_CUDA_FREE_RESERVE_MB", 0);
++        if (reserve_mb > 0) {
++            size_t free_bytes = 0;
++            size_t total_bytes = 0;
++            if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
++                const long long reserve_bytes = reserve_mb * 1024LL * 1024LL;
++                const long long usable_bytes = (long long) free_bytes - reserve_bytes;
++                const int cap_by_free = usable_bytes > 0 ? (int) (usable_bytes / std::max(1, expert_size_bytes)) : 0;
++                budget_max_capacity = std::max(1, std::min(budget_max_capacity, cap_by_free));
++            } else {
++                cudaGetLastError();
++            }
++        }
++
++        requested_capacity = std::max(1, std::min(num_experts_capacity, total_experts));
++        if (budget_max_capacity > 0) {
++            requested_capacity = std::min(requested_capacity, budget_max_capacity);
++        }
++        capacity = requested_capacity;
++        CUDA_CHECK(cudaMalloc(&d_pool, (size_t)capacity * expert_size_bytes));
++        CUDA_CHECK(cudaMalloc(&d_physical_ids, 65536 * sizeof(int))); // Max 65536 ids for large batches
++        CUDA_CHECK(cudaMemset(d_physical_ids, 0, 65536 * sizeof(int)));
++
++        h_experts_mmap = original_d_ptr;
++        cudaPointerAttributes attr;
++        cudaError_t attr_status = cudaPointerGetAttributes(&attr, original_d_ptr);
++        if (attr_status == cudaSuccess) {
++#if CUDART_VERSION >= 10000
++            source_on_device = attr.type == cudaMemoryTypeDevice;
++#else
++            source_on_device = attr.memoryType == cudaMemoryTypeDevice;
++#endif
++        } else {
++            cudaGetLastError();
++            source_on_device = false;
++        }
++        
++        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
++        cudaEventCreate(&event);
++        
++        reset_cache_state();
++        
++        initialized = true;
++
++        if (pool_mb > 0 || reserve_mb > 0 || strict_budget) {
++            fprintf(stderr,
++                    "EVM: budget controls active: requested_capacity=%d, budget_max_capacity=%d, "
++                    "expert_size=%.2f MB, strict=%d\n",
++                    requested_capacity,
++                    budget_max_capacity,
++                    (double) expert_size_bytes / (1024.0 * 1024.0),
++                    strict_budget ? 1 : 0);
++        }
++    }
++    
++    bool is_initialized() const { return initialized; }
++    int get_capacity() const { return capacity; }
++
++    void update_phase(int batch_size) {
++        if (!is_initialized()) return;
++        std::lock_guard<std::mutex> lock(mtx);
++
++        int threshold = 1;
++        if (const char * env = getenv("EVM_PREFILL_BATCH_THRESHOLD")) {
++            threshold = std::max(1, atoi(env));
++        }
++
++        const int target_capacity = batch_size > threshold ? total_experts : requested_capacity;
++        resize_pool_locked(target_capacity);
++    }
++
++    void ensure_experts(int* logical_ids, int count, cudaStream_t compute_stream) {
++        if (!is_initialized()) return;
++        std::lock_guard<std::mutex> lock(mtx);
++        
++        // CRITICAL RACE CONDITION FIX:
++        // We must wait for the GPU to finish any previous kernels on compute_stream
++        // before we overwrite d_physical_ids or evict any experts from d_pool.
++        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
++        
++        std::unordered_set<int> unique_ids;
++        for (int i = 0; i < count; ++i) {
++            if (logical_ids[i] >= 0) {
++                unique_ids.insert(logical_ids[i]);
++            }
++        }
++        if ((int) unique_ids.size() > capacity) {
++            resize_pool_locked((int) unique_ids.size());
++        }
++
++        bool needs_sync = false;
++        
++        for (int i = 0; i < count; ++i) {
++            int log_id = logical_ids[i];
++            if (log_id < 0) continue;
++            if (log_id >= 2048) {
++                fprintf(stderr, "EVM: ignoring out-of-range logical expert id %d\n", log_id);
++                continue;
++            }
++            
++            auto it = cache_map.find(log_id);
++            if (it != cache_map.end()) {
++                metric_cache_hits++;
++                int phys_idx = *(it->second);
++                lru_list.erase(it->second);
++                lru_list.push_front(phys_idx);
++                cache_map[log_id] = lru_list.begin();
++                logical_ids[i] = phys_idx;
++            } else {
++                metric_cache_misses++;
++                int phys_idx = lru_list.back();
++                lru_list.pop_back();
++                
++                int old_log = slots[phys_idx].logical_expert_id;
++                if (old_log != -1) {
++                    metric_evictions++;
++                    cache_map.erase(old_log);
++                }
++                
++                slots[phys_idx].logical_expert_id = log_id;
++                
++                size_t offset = (size_t)log_id * expert_size_bytes;
++                size_t dst_offset = (size_t)phys_idx * expert_size_bytes;
++                
++                CUDA_CHECK(cudaMemcpyAsync(
++                    d_pool + dst_offset,
++                    h_experts_mmap + offset,
++                    expert_size_bytes,
++                    source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
++                    stream));
++                metric_bytes_transferred += expert_size_bytes;
++                needs_sync = true;
++                
++                lru_list.push_front(phys_idx);
++                cache_map[log_id] = lru_list.begin();
++                logical_ids[i] = phys_idx;
++            }
++        }
++        
++        // Now it's safe to overwrite d_physical_ids because compute_stream is idle
++        // Use synchronous cudaMemcpy so logical_ids (h_ids vector) doesn't go out of scope!
++        CUDA_CHECK(cudaMemcpy(d_physical_ids, logical_ids, count * sizeof(int), cudaMemcpyHostToDevice));
++        needs_sync = true;
++        
++        if (needs_sync) {
++            cudaEventRecord(event, stream);
++            cudaStreamWaitEvent(compute_stream, event, 0);
++        }
++    }
++    
++    char* get_pool() { return d_pool; }
++    int* get_physical_ids() { return d_physical_ids; }
++};
++
++inline std::unordered_map<const ggml_tensor*, std::shared_ptr<Manager>>& get_managers_map() {
++    static std::unordered_map<const ggml_tensor*, std::shared_ptr<Manager>> managers;
++    return managers;
++}
++inline std::mutex& get_managers_mutex() {
++    static std::mutex mtx;
++    return mtx;
++}
++
++inline void print_all_stats() {
++    auto& managers = get_managers_map();
++    std::lock_guard<std::mutex> lock(get_managers_mutex());
++    uint64_t total_hits = 0;
++    uint64_t total_misses = 0;
++    uint64_t total_evictions = 0;
++    uint64_t total_bytes_transferred = 0;
++
++    for (auto& pair : managers) {
++        if (!pair.second) continue;
++        total_hits += pair.second->metric_cache_hits;
++        total_misses += pair.second->metric_cache_misses;
++        total_evictions += pair.second->metric_evictions;
++        total_bytes_transferred += pair.second->metric_bytes_transferred;
++    }
++
++    const uint64_t total = total_hits + total_misses;
++    if (total == 0) {
++        return;
++    }
++
++    fprintf(stderr, "\n[EVM Metrics]\n");
++    fprintf(stderr, "Cache Hits       : %llu\n", (unsigned long long)total_hits);
++    fprintf(stderr, "Cache Misses     : %llu\n", (unsigned long long)total_misses);
++    fprintf(stderr, "Evictions        : %llu\n", (unsigned long long)total_evictions);
++    fprintf(stderr, "Bytes Transferred: %llu (%.2f MB)\n", (unsigned long long)total_bytes_transferred, (double)total_bytes_transferred / (1024*1024));
++    fprintf(stderr, "Hit Rate         : %.2f%%\n", 100.0 * total_hits / total);
++
++    // Clear counters so later explicit calls and manager destructors do not double-report.
++    for (auto& pair : managers) {
++        if (!pair.second) continue;
++        pair.second->metric_cache_hits = 0;
++        pair.second->metric_cache_misses = 0;
++        pair.second->metric_evictions = 0;
++        pair.second->metric_bytes_transferred = 0;
++    }
++    fflush(stderr);
++}
++
++inline Manager* get_manager(const ggml_tensor* t) {
++    auto& managers = get_managers_map();
++    std::lock_guard<std::mutex> lock(get_managers_mutex());
++    if (managers.find(t) == managers.end()) {
++        static bool atexit_registered = false;
++        if (!atexit_registered) {
++            atexit(print_all_stats);
++            atexit_registered = true;
++        }
++        managers[t] = std::make_shared<Manager>();
++    }
++    return managers[t].get();
++}
++
++struct ShapeSwapper {
++    ggml_tensor* ids;
++    void* original_data;
++    int64_t original_ne2;
++    
++    ShapeSwapper(const ggml_tensor* ids_ptr, void* new_data, int64_t new_ne2 = -1) 
++        : ids(const_cast<ggml_tensor*>(ids_ptr)), original_data(ids_ptr->data), original_ne2(ids_ptr->ne[2]) 
++    {
++        ids->data = new_data;
++        if (new_ne2 > 0) {
++            ids->ne[2] = new_ne2;
++        }
++    }
++    ~ShapeSwapper() {
++        ids->data = original_data;
++        ids->ne[2] = original_ne2;
++    }
++};
++
++} // namespace EVM
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 71cc2a619..3ea493648 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1,4 +1,5 @@
+ #include "ggml-cuda.h"
++#include <memory>
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
+@@ -24,6 +25,7 @@
+ #include "ggml-cuda/cumsum.cuh"
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
++#include "ggml-cuda/evm.cuh"
+ #include "ggml-cuda/fattn.cuh"
+ #include "ggml-cuda/fwht.cuh"
+ #include "ggml-cuda/getrows.cuh"
+@@ -1762,6 +1764,86 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
++    
++    ggml_tensor ids_copy;
++    ggml_tensor src0_copy;
++
++    // EVM Interception: Check if this is an MoE layer
++    static int ignore_count = -1;
++    static int target_count = -1;
++    if (ignore_count == -1) {
++        if (getenv("EVM_IGNORE_EXPERT_COUNT")) {
++            ignore_count = atoi(getenv("EVM_IGNORE_EXPERT_COUNT"));
++        } else {
++            ignore_count = 0;
++        }
++    }
++    if (target_count == -1) {
++        if (getenv("EVM_TARGET_EXPERT_COUNT")) {
++            target_count = atoi(getenv("EVM_TARGET_EXPERT_COUNT"));
++        } else {
++            target_count = 0;
++        }
++    }
++
++    bool evm_eligible = ids && src0->ne[2] > 1 && !getenv("EVM_DISABLE");
++    if (evm_eligible && target_count > 0) {
++        evm_eligible = src0->ne[2] == target_count;
++    } else if (evm_eligible && ignore_count > 0) {
++        evm_eligible = src0->ne[2] != ignore_count;
++    }
++
++    if (evm_eligible) {
++        if (getenv("EVM_DEBUG")) {
++            fprintf(stderr, "EVM: intercepting mul_mat_id experts=%lld ids=[%lld,%lld]\n",
++                    (long long) src0->ne[2],
++                    ids ? (long long) ids->ne[0] : 0,
++                    ids ? (long long) ids->ne[1] : 0);
++        }
++        EVM::Manager* mgr = EVM::get_manager(src0);
++        if (!mgr->is_initialized()) {
++            int total_experts = src0->ne[2];
++            int expert_size = src0->nb[2];
++            
++            // Read capacity from environment variable (percentage 1-100)
++            int capacity_pct = 100; // default 100%
++            const char* env_pct = getenv("EVM_CAPACITY_PCT");
++            if (env_pct) {
++                capacity_pct = atoi(env_pct);
++                if (capacity_pct < 1) capacity_pct = 1;
++                if (capacity_pct > 100) capacity_pct = 100;
++            }
++            int capacity = (total_experts * capacity_pct) / 100;
++            if (capacity < 1) capacity = 1;
++            
++            mgr->init(capacity, expert_size, (char*)src0->data, total_experts);
++        }
++        
++        size_t count = ids->ne[0] * ids->ne[1];
++        std::vector<int> h_ids(count);
++        if (ids->nb[1] == ids->ne[0] * sizeof(int)) {
++            cudaMemcpyAsync(h_ids.data(), ids->data, count * sizeof(int), cudaMemcpyDeviceToHost, ctx.stream());
++        } else {
++            cudaMemcpy2DAsync(h_ids.data(), ids->ne[0] * sizeof(int), ids->data, ids->nb[1], ids->ne[0] * sizeof(int), ids->ne[1], cudaMemcpyDeviceToHost, ctx.stream());
++        }
++        cudaStreamSynchronize(ctx.stream());
++        
++        mgr->update_phase(ids->ne[1]);
++        mgr->ensure_experts(h_ids.data(), count, ctx.stream());
++        
++        // Shallow copy tensors to avoid race conditions with concurrent GGML nodes
++        ids_copy = *ids;
++        ids_copy.data = mgr->get_physical_ids();
++        ids_copy.nb[1] = ids_copy.nb[0] * ids_copy.ne[0];
++        ids_copy.nb[2] = ids_copy.nb[1] * ids_copy.ne[1];
++        ids_copy.nb[3] = ids_copy.nb[2] * ids_copy.ne[2];
++        ids = &ids_copy;
++
++        src0_copy = *src0;
++        src0_copy.data = mgr->get_pool();
++        src0_copy.ne[2] = mgr->get_capacity();
++        src0 = &src0_copy;
++    }
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
+@@ -1776,10 +1858,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+                     return;
+                 }
+             } else {
+-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+-                    return;
+-                }
++                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
++                return;
+             }
+         }
+ 
+@@ -2266,6 +2346,8 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
+ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
++    EVM::print_all_stats();
++
+     delete cuda_ctx;
+     delete backend;
+ }
+@@ -3649,17 +3731,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #ifdef USE_CUDA_GRAPH
+ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-
+-    if (graph->graph == nullptr) {
+-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
+-            if (!graph->disable_due_to_gpu_arch) {
+-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+-            }
+-            graph->disable_due_to_gpu_arch = true;
+-        }
+-    }
+-
+-    return graph->is_enabled();
++    graph->disable_due_to_gpu_arch = true; // EVM REQUIRES CUDA GRAPHS DISABLED
++    return false;
+ }
+ #endif // USE_CUDA_GRAPH
+ 
+@@ -4879,6 +4952,10 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
+     return &reg;
+ }
+ 
++GGML_BACKEND_API void ggml_backend_cuda_print_evm_stats(void) {
++    EVM::print_all_stats();
++}
++
+ ggml_backend_t ggml_backend_cuda_init(int device) {
+     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index dc41d6690..d461ffe65 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1359,6 +1359,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     }
+ 
+ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
++    if (il >= 0) {
++        ggml_format_name(cur, "%s-%d", name, il);
++    } else {
++        ggml_set_name(cur, name);
++    }
+     if (cb_func) {
+         cb_func(ubatch, cur, name, il);
+     }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index adacf702d..26f4693e3 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1643,6 +1643,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
++    if (getenv("EVM_CAPACITY_PCT") != nullptr) {
++        int ignore_count = 0;
++        if (getenv("EVM_IGNORE_EXPERT_COUNT") != nullptr) {
++            ignore_count = atoi(getenv("EVM_IGNORE_EXPERT_COUNT"));
++        }
++        int target_count = 0;
++        if (getenv("EVM_TARGET_EXPERT_COUNT") != nullptr) {
++            target_count = atoi(getenv("EVM_TARGET_EXPERT_COUNT"));
++        }
++        if (tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS) {
++            const bool target_matches = target_count <= 0 || hparams.n_expert == (uint32_t) target_count;
++            const bool ignored = ignore_count > 0 && hparams.n_expert == (uint32_t) ignore_count;
++            if (target_matches && !ignored && getenv("EVM_CPU_BACKING") != nullptr) {
++                buft_list_layer = &pimpl->cpu_buft_list;
++            }
++        }
++    }
+     return ml.create_tensor(
+         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+         tn, ne, flags);
+diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
+index d974a4019..9a52ef68a 100644
+--- a/tools/cli/cli.cpp
++++ b/tools/cli/cli.cpp
+@@ -17,6 +17,10 @@
+ #include <thread>
+ #include <signal.h>
+ 
++#ifdef GGML_USE_CUDA
++extern "C" void ggml_backend_cuda_print_evm_stats(void);
++#endif
++
+ #if defined(_WIN32)
+ #define WIN32_LEAN_AND_MEAN
+ #ifndef NOMINMAX
+@@ -661,6 +665,9 @@ int llama_cli(int argc, char ** argv) {
+             console::set_display(DISPLAY_TYPE_INFO);
+             console::log("\n");
+             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
++#ifdef GGML_USE_CUDA
++            ggml_backend_cuda_print_evm_stats();
++#endif
+             console::set_display(DISPLAY_TYPE_RESET);
+         }
+ 
+-- 
+2.43.0.windows.1
+

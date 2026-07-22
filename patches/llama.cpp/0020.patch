@@ -1,0 +1,165 @@
+From 16b0df06c5457ed157bce230c51bfce8f7baf623 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Mon, 13 Jul 2026 16:55:27 -0400
+Subject: [PATCH 20/26] Add learned EVM eviction scheduler
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 100 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 99 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 0fe27ae12..2655e7cad 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -10,6 +10,7 @@
+ #include <cstdio>
+ #include <memory>
+ #include <algorithm>
++#include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+@@ -271,6 +272,67 @@ struct CacheSlot {
+     int logical_expert_id;
+ };
+ 
++// Process-wide, optional prior exported by the offline layer-aware trainer.
++// It is deliberately keyed only by layer and expert IDs so it can be used by
++// the runtime after routing without changing router values or expert math.
++class LearnedPriorRegistry {
++private:
++    bool attempted = false;
++    std::unordered_map<int, std::vector<float>> matrices;
++    std::mutex mtx;
++
++    void load_locked() {
++        attempted = true;
++        const char * path = getenv("EVM_LEARNED_SCHEDULER_PATH");
++        if (!path || !*path) return;
++        std::ifstream input(path);
++        if (!input) {
++            fprintf(stderr, "EVM: unable to open learned scheduler prior: %s\n", path);
++            return;
++        }
++        std::string line;
++        while (std::getline(input, line)) {
++            if (line.empty() || line[0] == '#') continue;
++            std::istringstream fields(line);
++            int layer = -1;
++            int source = -1;
++            int candidate = -1;
++            float score = 0.0f;
++            if (!(fields >> layer >> source >> candidate >> score) || layer < 0 || source < 0 || candidate < 0) {
++                fprintf(stderr, "EVM: malformed learned scheduler prior\n");
++                matrices.clear();
++                return;
++            }
++            const int width = std::max(source, candidate) + 1;
++            auto & matrix = matrices[layer];
++            const int old_width = matrix.empty() ? 0 : (int) std::sqrt((double) matrix.size());
++            const int new_width = std::max(old_width, width);
++            if (new_width != old_width) {
++                std::vector<float> expanded((size_t) new_width * new_width, 0.0f);
++                for (int row = 0; row < old_width; ++row) {
++                    std::copy_n(matrix.data() + (size_t) row * old_width, old_width, expanded.data() + (size_t) row * new_width);
++                }
++                matrix.swap(expanded);
++            }
++            matrix[(size_t) source * new_width + candidate] = score;
++        }
++    }
++
++public:
++    const std::vector<float> * matrix(int layer, int experts) {
++        std::lock_guard<std::mutex> lock(mtx);
++        if (!attempted) load_locked();
++        const auto it = matrices.find(layer);
++        if (it == matrices.end() || (int) it->second.size() != experts * experts) return nullptr;
++        return &it->second;
++    }
++};
++
++inline LearnedPriorRegistry & learned_prior_registry() {
++    static LearnedPriorRegistry registry;
++    return registry;
++}
++
+ class Manager {
+ private:
+     int capacity = 0;
+@@ -291,6 +353,7 @@ private:
+     bool source_from_vault = false;
+     bool ability_enabled = false;
+     bool ability_pack_only = false;
++    int layer_index = -1;
+     std::vector<int> ability_experts;
+     std::unordered_set<int> pinned_experts;
+     std::string vault_tensor_name;
+@@ -406,6 +469,31 @@ public:
+         return lru_list.end();
+     }
+ 
++    std::list<int>::iterator learned_eviction_candidate(const std::unordered_set<int> & protected_ids) {
++        if (read_env_ll("EVM_LEARNED_SCHEDULER", 0) == 0) return eviction_candidate(protected_ids);
++        const auto * matrix = learned_prior_registry().matrix(layer_index, total_experts);
++        if (!matrix || last_routed_experts.empty()) return eviction_candidate(protected_ids);
++        std::vector<float> scores((size_t) total_experts, 0.0f);
++        for (const int source : last_routed_experts) {
++            if (source < 0 || source >= total_experts) continue;
++            for (int candidate = 0; candidate < total_experts; ++candidate) {
++                scores[(size_t) candidate] += (*matrix)[(size_t) source * total_experts + candidate];
++            }
++        }
++        auto selected = lru_list.end();
++        float selected_score = 0.0f;
++        for (auto it = lru_list.begin(); it != lru_list.end(); ++it) {
++            const int logical = slots[*it].logical_expert_id;
++            if (logical >= 0 && (pinned_experts.find(logical) != pinned_experts.end() || protected_ids.find(logical) != protected_ids.end())) continue;
++            const float score = logical < 0 ? -1.0f : scores[(size_t) logical];
++            if (selected == lru_list.end() || score <= selected_score) {
++                selected = it;
++                selected_score = score;
++            }
++        }
++        return selected == lru_list.end() ? eviction_candidate(protected_ids) : selected;
++    }
++
+     void queue_predictive_prefetch_locked(const std::vector<int> & current_ids) {
+         if (read_env_ll("EVM_ONLINE_PREDICTOR", 0) == 0 || ability_pack_only || current_ids.empty()) {
+             last_routed_experts = current_ids;
+@@ -650,6 +738,15 @@ public:
+ 
+         h_experts_mmap = original_d_ptr;
+         vault_tensor_name = tensor_name;
++        const std::string layer_marker = "blk.";
++        const size_t layer_start = vault_tensor_name.find(layer_marker);
++        if (layer_start != std::string::npos) {
++            const size_t digits_start = layer_start + layer_marker.size();
++            const size_t digits_end = vault_tensor_name.find('.', digits_start);
++            if (digits_end != std::string::npos) {
++                try { layer_index = std::stoi(vault_tensor_name.substr(digits_start, digits_end - digits_start)); } catch (...) { layer_index = -1; }
++            }
++        }
+         source_from_vault = getenv("EVM_EXPERT_VAULT_INDEX") != nullptr;
+         if (source_from_vault && !vault_registry().has_tensor(tensor_name, total_experts, (size_t) expert_size_bytes)) {
+             fprintf(stderr, "EVM: expert vault is missing or incompatible with tensor %s\n", tensor_name);
+@@ -798,7 +895,7 @@ public:
+                 if (metrics_enabled) {
+                     metric_cache_misses++;
+                 }
+-                auto victim = eviction_candidate();
++                auto victim = learned_eviction_candidate(unique_ids);
+                 int phys_idx = *victim;
+                 lru_list.erase(victim);
+                 
+@@ -872,6 +969,7 @@ public:
+         for (const int logical : unique_ids) {
+             current_ids.push_back(logical);
+         }
++        last_routed_experts = current_ids;
+         queue_predictive_prefetch_locked(current_ids);
+ 
+     }
+-- 
+2.43.0.windows.1
+

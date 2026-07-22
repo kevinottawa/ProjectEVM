@@ -1,0 +1,11 @@
+datasets
+gguf
+huggingface_hub
+Markdown
+matplotlib
+numpy
+pandas
+Pillow
+psutil
+pyarrow
+seaborn

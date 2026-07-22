@@ -1,0 +1,196 @@
+From c5b04c42c71d553f28260d20c3238fce3c13bbd3 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Tue, 14 Jul 2026 19:53:52 -0400
+Subject: [PATCH 26/26] Prototype device-scored EVM scheduler
+
+---
+ ggml/src/ggml-cuda/evm.cuh      | 22 ++++++++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu | 63 +++++++++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 604a4bb4d..404759db5 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -359,6 +359,8 @@ private:
+     float* d_router_candidate_scores = nullptr;
+     float* h_router_candidate_scores = nullptr;
+     float* d_learned_router_weights = nullptr;
++    float* d_future_expert_scores = nullptr;
++    float* h_future_expert_scores = nullptr;
+     int* h_physical_ids[2] = {nullptr, nullptr};
+     cudaEvent_t physical_ids_events[2] = {nullptr, nullptr};
+     bool physical_ids_event_recorded[2] = {false, false};
+@@ -465,10 +467,12 @@ public:
+         if (d_router_candidates) cudaFree(d_router_candidates);
+         if (d_router_candidate_scores) cudaFree(d_router_candidate_scores);
+         if (d_learned_router_weights) cudaFree(d_learned_router_weights);
++        if (d_future_expert_scores) cudaFree(d_future_expert_scores);
+         if (h_page_table) cudaFreeHost(h_page_table);
+         if (h_page_status) cudaFreeHost(h_page_status);
+         if (h_router_candidates) cudaFreeHost(h_router_candidates);
+         if (h_router_candidate_scores) cudaFreeHost(h_router_candidate_scores);
++        if (h_future_expert_scores) cudaFreeHost(h_future_expert_scores);
+     }
+ 
+     void reset_cache_state() {
+@@ -527,7 +531,7 @@ public:
+     }
+ 
+     std::list<int>::iterator learned_eviction_candidate(const std::unordered_set<int> & protected_ids) {
+-        if (read_env_ll("EVM_LEARNED_SCHEDULER", 0) == 0 && read_env_ll("EVM_LEARNED_ROUTER_SCORE", 0) == 0) {
++        if (read_env_ll("EVM_LEARNED_SCHEDULER", 0) == 0 && read_env_ll("EVM_LEARNED_ROUTER_SCORE", 0) == 0 && read_env_ll("EVM_GPU_SCHEDULER", 0) == 0) {
+             return eviction_candidate(protected_ids);
+         }
+         if (read_env_ll("EVM_LEARNED_ROUTER_SCORE", 0) != 0 && future_expert_scores.size() == (size_t) total_experts) {
+@@ -932,6 +936,8 @@ public:
+         CUDA_CHECK(cudaMallocHost(&h_router_candidates, 8 * sizeof(int)));
+         CUDA_CHECK(cudaMalloc(&d_router_candidate_scores, 8 * sizeof(float)));
+         CUDA_CHECK(cudaMallocHost(&h_router_candidate_scores, 8 * sizeof(float)));
++        CUDA_CHECK(cudaMalloc(&d_future_expert_scores, (size_t) total_experts * sizeof(float)));
++        CUDA_CHECK(cudaMallocHost(&h_future_expert_scores, (size_t) total_experts * sizeof(float)));
+ 
+         reset_cache_state();
+         ability_enabled = getenv("EVM_ABILITY_PACK_INDEX") != nullptr;
+@@ -1294,13 +1300,15 @@ public:
+     int* get_router_candidates_host() { return h_router_candidates; }
+     float* get_router_candidate_scores_device() { return d_router_candidate_scores; }
+     float* get_router_candidate_scores_host() { return h_router_candidate_scores; }
++    float* get_future_expert_scores_device() { return d_future_expert_scores; }
++    float* get_future_expert_scores_host() { return h_future_expert_scores; }
+     int get_total_experts() const { return total_experts; }
+ 
+     // The offline model predicts the next 3--17 tokens from the complete
+     // current router vector. Keep its tiny layer matrix on-device so the
+     // host receives only the top candidate IDs, never a full score vector.
+     const float * get_learned_router_weights_device() {
+-        if (read_env_ll("EVM_LEARNED_ROUTER_SCORE", 0) == 0) return nullptr;
++        if (read_env_ll("EVM_LEARNED_ROUTER_SCORE", 0) == 0 && read_env_ll("EVM_GPU_SCHEDULER", 0) == 0) return nullptr;
+         std::lock_guard<std::mutex> lock(mtx);
+         if (d_learned_router_weights) return d_learned_router_weights;
+         const auto * matrix = learned_prior_registry().matrix(layer_index, total_experts);
+@@ -1318,6 +1326,10 @@ public:
+         return initialized && total_experts <= 64 && read_env_ll("EVM_GPU_PAGE_TABLE", 0) != 0;
+     }
+ 
++    bool gpu_scheduler_enabled() const {
++        return initialized && total_experts <= 64 && read_env_ll("EVM_GPU_SCHEDULER", 0) != 0;
++    }
++
+     void prepare_gpu_page_mapping(int count) {
+         std::lock_guard<std::mutex> lock(mtx);
+         ensure_physical_ids_capacity_locked(count);
+@@ -1381,6 +1393,12 @@ public:
+         queue_router_score_prefetch_locked(candidates.data(), candidate_scores.data(), (int) candidates.size(), current_ids);
+     }
+ 
++    void update_future_expert_scores(const float * scores) {
++        if (!scores) return;
++        std::lock_guard<std::mutex> lock(mtx);
++        future_expert_scores.assign(scores, scores + total_experts);
++    }
++
+     void note_router_score_bridge(bool captured) {
+         std::lock_guard<std::mutex> lock(mtx);
+         metric_router_score_bridge_attempts++;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b40a0e84c..3beaf9d87 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1866,6 +1866,24 @@ static __global__ void ggml_cuda_evm_rank_router_candidates_kernel(
+     }
+ }
+ 
++static __global__ void ggml_cuda_evm_update_future_scores_kernel(
++        const float * scores,
++        const float * learned_weights,
++        int total_experts,
++        float * future_scores) {
++    if (blockIdx.x != 0 || threadIdx.x != 0) return;
++    for (int expert = 0; expert < total_experts; ++expert) {
++        float score = scores[expert];
++        if (learned_weights) {
++            score = 0.0f;
++            for (int source = 0; source < total_experts; ++source) {
++                score += scores[source] * learned_weights[source * total_experts + expert];
++            }
++        }
++        future_scores[expert] = fmaxf(0.0f, score);
++    }
++}
++
+ struct ggml_cuda_evm_router_candidates {
+     std::vector<int> ids;
+     std::vector<float> scores;
+@@ -1921,6 +1939,45 @@ static ggml_cuda_evm_router_candidates ggml_cuda_evm_copy_router_candidates_to_h
+     };
+ }
+ 
++static bool ggml_cuda_evm_update_future_scores(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * ids,
++        EVM::Manager * mgr) {
++    if (!mgr->gpu_scheduler_enabled()) return false;
++    const int total_experts = mgr->get_total_experts();
++    if (total_experts > 64) return false;
++    const ggml_tensor * scores = ids ? ids->src[0] : nullptr;
++    while (scores && (scores->op == GGML_OP_VIEW || scores->op == GGML_OP_RESHAPE ||
++            scores->op == GGML_OP_CONT || scores->op == GGML_OP_ARGSORT)) {
++        scores = scores->src[0];
++    }
++    if (!scores || scores->type != GGML_TYPE_F32 || scores->ne[0] != total_experts || scores->ne[1] <= 0 || !scores->data) {
++        return false;
++    }
++    const int64_t row = scores->ne[1] - 1;
++    ggml_cuda_evm_update_future_scores_kernel<<<1, 1, 0, ctx.stream()>>>(
++        (const float *) ((const char *) scores->data + (size_t) row * scores->nb[1]),
++        mgr->get_learned_router_weights_device(),
++        total_experts,
++        mgr->get_future_expert_scores_device());
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
++static void ggml_cuda_evm_copy_future_scores_to_host(
++        ggml_backend_cuda_context & ctx,
++        EVM::Manager * mgr) {
++    if (!mgr->gpu_scheduler_enabled()) return;
++    CUDA_CHECK(cudaMemcpyAsync(
++        mgr->get_future_expert_scores_host(),
++        mgr->get_future_expert_scores_device(),
++        (size_t) mgr->get_total_experts() * sizeof(float),
++        cudaMemcpyDeviceToHost,
++        ctx.stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    mgr->update_future_expert_scores(mgr->get_future_expert_scores_host());
++}
++
+ // Cache-hit remapping is a tiny GPU operation.  The output is contiguous even
+ // when the logical ID view has a row stride, matching the replacement view
+ // used by mul_mat_id below.  A 64-bit activity mask is enough for the current
+@@ -1989,6 +2046,7 @@ static bool ggml_cuda_evm_try_gpu_page_remap(
+     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+     const unsigned long long * status = mgr->get_host_page_status();
+     if (status[1] != 0) {
++        ggml_cuda_evm_copy_future_scores_to_host(ctx, mgr);
+         mgr->record_gpu_page_miss();
+         return false;
+     }
+@@ -2059,9 +2117,14 @@ static bool ggml_cuda_evm_remap_mul_mat_id(
+     int count = 0;
+     mgr->update_phase(ids->ne[1]);
+     count = (int) (ids->ne[0] * ids->ne[1]);
++    const bool gpu_scheduler = ggml_cuda_evm_update_future_scores(ctx, ids, mgr);
++    const bool gpu_page_table = mgr->gpu_page_table_enabled();
+     if (!ggml_cuda_evm_try_gpu_page_remap(ctx, ids, mgr, count)) {
+         std::vector<int> h_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
+         const std::vector<int> logical_ids = h_ids;
++        if (gpu_scheduler && !gpu_page_table) {
++            ggml_cuda_evm_copy_future_scores_to_host(ctx, mgr);
++        }
+         const ggml_cuda_evm_router_candidates router_candidates = ggml_cuda_evm_copy_router_candidates_to_host(ctx, ids, mgr);
+         if (getenv("EVM_ROUTER_SCORE_PREFETCH") != nullptr && atoi(getenv("EVM_ROUTER_SCORE_PREFETCH")) != 0) {
+             mgr->note_router_score_bridge(!router_candidates.ids.empty());
+-- 
+2.43.0.windows.1
+

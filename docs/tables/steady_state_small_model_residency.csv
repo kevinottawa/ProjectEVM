@@ -1,0 +1,3 @@
+model,demand_slots_per_tensor,valid_lru_trials,lru_generation_tps,lru_hit_rate_pct,lru_peak_vram_mb,score_prefetch_generation_tps,score_prefetch_hit_rate_pct,score_prefetch_valid_trials
+Qwen1.5-MoE,48,3/3,37.1,81.71,9037,25.93,83.63,3/3
+DeepSeek-Coder-V2-Lite,40,3/3,21.1,81.58,7360,,,not run

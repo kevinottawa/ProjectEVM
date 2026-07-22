@@ -1,0 +1,281 @@
+From 253249065390e521ab4e2d5599688ef405fa25dd Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Sat, 11 Jul 2026 14:24:07 -0400
+Subject: [PATCH 13/26] Add static ability pack residency and profiling
+
+---
+ ggml/src/ggml-cuda/evm.cuh | 121 +++++++++++++++++++++++++++++++++++--
+ src/llama-model-loader.cpp |   8 ++-
+ 2 files changed, 124 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 2d006c227..72ff55512 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -129,11 +129,16 @@ public:
+         if (!attempted) load();
+         if (!available) return false;
+         const auto it = slices.find(tensor);
+-        if (it == slices.end() || it->second.size() != (size_t) expert_count) return false;
++        if (it == slices.end() || it->second.size() > (size_t) expert_count) return false;
++        const bool partial = getenv("EVM_ABILITY_PACK_ONLY") != nullptr && atoi(getenv("EVM_ABILITY_PACK_ONLY")) != 0;
++        if (!partial && it->second.size() != (size_t) expert_count) return false;
++        size_t valid = 0;
+         for (const VaultSlice & slice : it->second) {
++            if (slice.bytes == 0 && partial) continue;
+             if (slice.bytes != bytes_per_expert || slice.offset > size || slice.bytes > size - slice.offset) return false;
++            valid++;
+         }
+-        return true;
++        return valid > 0;
+     }
+ 
+     const char * expert_data(const std::string & tensor, int expert, size_t bytes_per_expert) {
+@@ -160,6 +165,31 @@ inline VaultRegistry & vault_registry() {
+     return registry;
+ }
+ 
++inline const std::unordered_map<std::string, std::vector<int>> & ability_pack_experts() {
++    static std::once_flag once;
++    static std::unordered_map<std::string, std::vector<int>> selected;
++    std::call_once(once, [] {
++        const char * path = getenv("EVM_ABILITY_PACK_INDEX");
++        if (!path || !*path) return;
++        std::ifstream index(path);
++        std::string line;
++        while (std::getline(index, line)) {
++            if (line.empty() || line[0] == '#') continue;
++            std::istringstream fields(line);
++            std::string tensor;
++            std::string expert_text;
++            if (!std::getline(fields, tensor, '\t') || !std::getline(fields, expert_text, '\t')) continue;
++            selected[tensor].push_back(std::stoi(expert_text));
++        }
++        for (auto & entry : selected) {
++            auto & experts = entry.second;
++            std::sort(experts.begin(), experts.end());
++            experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
++        }
++    });
++    return selected;
++}
++
+ struct PinnedStageSlot {
+     char * data = nullptr;
+     cudaEvent_t ready = nullptr;
+@@ -234,6 +264,10 @@ private:
+     int physical_ids_stage_index = 0;
+     bool source_on_device = false;
+     bool source_from_vault = false;
++    bool ability_enabled = false;
++    bool ability_pack_only = false;
++    std::vector<int> ability_experts;
++    std::unordered_set<int> pinned_experts;
+     std::string vault_tensor_name;
+     
+     cudaStream_t stream;
+@@ -247,6 +281,7 @@ private:
+     bool initialized = false;
+     bool strict_budget = false;
+     bool metrics_enabled = true;
++    std::vector<uint64_t> expert_access_counts;
+     std::mutex mtx;
+ 
+     static long long read_env_ll(const char * name, long long default_value = 0) {
+@@ -264,6 +299,7 @@ public:
+     uint64_t metric_cache_misses = 0;
+     uint64_t metric_bytes_transferred = 0;
+     uint64_t metric_evictions = 0;
++    uint64_t metric_pack_substitutions = 0;
+ 
+ public:
+     Manager() {}
+@@ -277,8 +313,22 @@ public:
+                 fprintf(stderr, "Evictions        : %llu\n", (unsigned long long)metric_evictions);
+                 fprintf(stderr, "Bytes Transferred: %llu (%.2f MB)\n", (unsigned long long)metric_bytes_transferred, (double)metric_bytes_transferred / (1024*1024));
+                 fprintf(stderr, "Hit Rate         : %.2f%%\n", 100.0 * metric_cache_hits / total);
++                fprintf(stderr, "Pack Substitutions: %llu\n", (unsigned long long) metric_pack_substitutions);
+                 fflush(stderr);
+             }
++            if (const char * profile_path = getenv("EVM_ROUTING_PROFILE_PATH")) {
++                static std::mutex profile_mutex;
++                std::lock_guard<std::mutex> profile_lock(profile_mutex);
++                std::ofstream profile(profile_path, std::ios::app);
++                if (profile) {
++                    profile << "{\"tensor\":\"" << vault_tensor_name << "\",\"counts\":[";
++                    for (size_t i = 0; i < expert_access_counts.size(); ++i) {
++                        if (i) profile << ',';
++                        profile << expert_access_counts[i];
++                    }
++                    profile << "]}\n";
++                }
++            }
+             cudaStreamDestroy(stream);
+             cudaEventDestroy(event);
+             cudaEventDestroy(pool_reuse_event);
+@@ -301,6 +351,43 @@ public:
+         }
+     }
+ 
++    std::list<int>::iterator eviction_candidate() {
++        auto it = lru_list.end();
++        while (it != lru_list.begin()) {
++            --it;
++            const int logical = slots[*it].logical_expert_id;
++            if (logical < 0 || pinned_experts.find(logical) == pinned_experts.end()) return it;
++        }
++        fprintf(stderr, "EVM: ability pack leaves no fallback slot for tensor %s\n", vault_tensor_name.c_str());
++        abort();
++    }
++
++    void preload_ability_experts() {
++        if (!ability_enabled) return;
++        const size_t required = ability_experts.size() + (ability_pack_only ? 0 : 1);
++        if ((size_t) capacity < required) {
++            fprintf(stderr, "EVM: ability pack requires capacity >= %zu for tensor %s\n", required, vault_tensor_name.c_str());
++            abort();
++        }
++        cache_map.clear();
++        lru_list.clear();
++        pinned_experts.clear();
++        for (size_t i = 0; i < ability_experts.size(); ++i) {
++            const int logical = ability_experts[i];
++            CUDA_CHECK(cudaMemcpyAsync(
++                d_pool + i * (size_t) expert_size_bytes,
++                vault_registry().expert_data(vault_tensor_name, logical, (size_t) expert_size_bytes),
++                expert_size_bytes, cudaMemcpyHostToDevice, stream));
++            slots[i].logical_expert_id = logical;
++            pinned_experts.insert(logical);
++            metric_bytes_transferred += expert_size_bytes;
++            lru_list.push_front((int) i);
++            cache_map[logical] = lru_list.begin();
++        }
++        for (int physical = (int) ability_experts.size(); physical < capacity; ++physical) lru_list.push_back(physical);
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++    }
++
+     void resize_pool_locked(int new_capacity) {
+         const int requested = std::max(1, std::min(new_capacity, total_experts));
+         if (strict_budget && budget_max_capacity > 0 && requested > budget_max_capacity) {
+@@ -324,6 +411,7 @@ public:
+         d_pool = new_pool;
+         capacity = new_capacity;
+         reset_cache_state();
++        if (ability_enabled) preload_ability_experts();
+     }
+ 
+     void ensure_physical_ids_capacity_locked(int count) {
+@@ -378,6 +466,7 @@ public:
+         if (initialized) return;
+         
+         total_experts = num_total_experts;
++        expert_access_counts.assign((size_t) total_experts, 0);
+         expert_size_bytes = bytes_per_expert;
+         strict_budget = read_env_ll("EVM_STRICT_BUDGET", 0) != 0;
+         metrics_enabled = read_env_ll("EVM_DISABLE_METRICS", 0) == 0;
+@@ -445,6 +534,20 @@ public:
+         }
+ 
+         reset_cache_state();
++        ability_enabled = getenv("EVM_ABILITY_PACK_INDEX") != nullptr;
++        ability_pack_only = read_env_ll("EVM_ABILITY_PACK_ONLY", 0) != 0;
++        if (ability_enabled) {
++            const auto & selections = ability_pack_experts();
++            const auto it = selections.find(vault_tensor_name);
++            if (it == selections.end() || it->second.empty()) {
++                fprintf(stderr, "EVM: no ability selection for tensor %s\n", vault_tensor_name.c_str());
++                abort();
++            }
++            ability_experts = it->second;
++            preload_ability_experts();
++            fprintf(stderr, "EVM: pinned %zu ability experts for tensor %s (pack_only=%d)\n",
++                    ability_experts.size(), vault_tensor_name.c_str(), ability_pack_only ? 1 : 0);
++        }
+         
+         initialized = true;
+ 
+@@ -510,6 +613,11 @@ public:
+                             logical_ids[i], total_experts);
+                     abort();
+                 }
++                expert_access_counts[(size_t) logical_ids[i]]++;
++                if (ability_pack_only && pinned_experts.find(logical_ids[i]) == pinned_experts.end()) {
++                    logical_ids[i] = ability_experts[(size_t) logical_ids[i] % ability_experts.size()];
++                    metric_pack_substitutions++;
++                }
+                 unique_ids.insert(logical_ids[i]);
+             }
+         }
+@@ -538,8 +646,9 @@ public:
+                 if (metrics_enabled) {
+                     metric_cache_misses++;
+                 }
+-                int phys_idx = lru_list.back();
+-                lru_list.pop_back();
++                auto victim = eviction_candidate();
++                int phys_idx = *victim;
++                lru_list.erase(victim);
+                 
+                 int old_log = slots[phys_idx].logical_expert_id;
+                 if (old_log != -1) {
+@@ -768,6 +877,7 @@ inline void print_all_stats() {
+     uint64_t total_misses = 0;
+     uint64_t total_evictions = 0;
+     uint64_t total_bytes_transferred = 0;
++    uint64_t total_pack_substitutions = 0;
+ 
+     for (auto& pair : managers) {
+         if (!pair.second) continue;
+@@ -775,6 +885,7 @@ inline void print_all_stats() {
+         total_misses += pair.second->metric_cache_misses;
+         total_evictions += pair.second->metric_evictions;
+         total_bytes_transferred += pair.second->metric_bytes_transferred;
++        total_pack_substitutions += pair.second->metric_pack_substitutions;
+     }
+ 
+     const uint64_t total = total_hits + total_misses;
+@@ -788,6 +899,7 @@ inline void print_all_stats() {
+     fprintf(stderr, "Evictions        : %llu\n", (unsigned long long)total_evictions);
+     fprintf(stderr, "Bytes Transferred: %llu (%.2f MB)\n", (unsigned long long)total_bytes_transferred, (double)total_bytes_transferred / (1024*1024));
+     fprintf(stderr, "Hit Rate         : %.2f%%\n", 100.0 * total_hits / total);
++    fprintf(stderr, "Pack Substitutions: %llu\n", (unsigned long long) total_pack_substitutions);
+ 
+     // Clear counters so later explicit calls and manager destructors do not double-report.
+     for (auto& pair : managers) {
+@@ -796,6 +908,7 @@ inline void print_all_stats() {
+         pair.second->metric_cache_misses = 0;
+         pair.second->metric_evictions = 0;
+         pair.second->metric_bytes_transferred = 0;
++        pair.second->metric_pack_substitutions = 0;
+     }
+     fflush(stderr);
+ }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 4b8b2ad1d..4bcd2a388 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -780,6 +780,13 @@ llama_model_loader::llama_model_loader(
+ 
+     n_kv      = gguf_get_n_kv(metadata);
+     n_tensors = weights_map.size();
++    if (getenv("EVM_EXPERT_VAULT_INDEX") != nullptr) {
++        for (const auto & entry : evm_vault_tensor_metadata()) {
++            if (weights_map.find(entry.first) == weights_map.end()) {
++                n_tensors++;
++            }
++        }
++    }
+ 
+     fver = (enum llama_fver) gguf_get_version(metadata);
+ 
+@@ -1328,7 +1335,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         // expert tensor. CUDA EVM replaces this source before any expert kernel.
+         static uint8_t virtual_expert_sentinel = 0;
+         tensor->data = &virtual_expert_sentinel;
+-        n_tensors++;
+         n_created++;
+         return tensor;
+     }
+-- 
+2.43.0.windows.1
+

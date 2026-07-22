@@ -1,0 +1,376 @@
+From e5bf606bded554bbf94ea28c0fdc439d0ff902a5 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Tue, 14 Jul 2026 08:47:17 -0400
+Subject: [PATCH 22/26] Add GPU EVM page-table hit mapping
+
+---
+ ggml/src/ggml-cuda/evm.cuh      | 123 ++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu |  86 ++++++++++++++++++++--
+ 2 files changed, 199 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 7af0213b7..fa89178f0 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -345,6 +345,12 @@ private:
+     char* h_experts_mmap = nullptr;
+     int* d_physical_ids = nullptr;
+     int d_physical_ids_capacity = 0;
++    // The logical-to-physical page table is deliberately tiny (one int per
++    // expert).  It lets CUDA remap cache hits without a host ID round-trip.
++    int* d_page_table = nullptr;
++    int* h_page_table = nullptr;
++    unsigned long long* d_page_status = nullptr; // [active expert mask, miss flag]
++    unsigned long long* h_page_status = nullptr;
+     int* h_physical_ids[2] = {nullptr, nullptr};
+     cudaEvent_t physical_ids_events[2] = {nullptr, nullptr};
+     bool physical_ids_event_recorded[2] = {false, false};
+@@ -393,6 +399,9 @@ public:
+     uint64_t metric_pack_substitutions = 0;
+     uint64_t metric_predictor_prefetches = 0;
+     uint64_t metric_predictor_hits = 0;
++    uint64_t metric_gpu_page_hits = 0;
++    uint64_t metric_gpu_page_misses = 0;
++    uint64_t metric_gpu_page_attempts = 0;
+ 
+ public:
+     Manager() {}
+@@ -409,6 +418,9 @@ public:
+                 fprintf(stderr, "Pack Substitutions: %llu\n", (unsigned long long) metric_pack_substitutions);
+                 fprintf(stderr, "Predictor Prefetches: %llu\n", (unsigned long long) metric_predictor_prefetches);
+                 fprintf(stderr, "Predictor Hits   : %llu\n", (unsigned long long) metric_predictor_hits);
++                fprintf(stderr, "GPU Page Hits    : %llu\n", (unsigned long long) metric_gpu_page_hits);
++                fprintf(stderr, "GPU Page Misses  : %llu\n", (unsigned long long) metric_gpu_page_misses);
++                fprintf(stderr, "GPU Page Attempts: %llu\n", (unsigned long long) metric_gpu_page_attempts);
+                 fflush(stderr);
+             }
+             if (const char * profile_path = getenv("EVM_ROUTING_PROFILE_PATH")) {
+@@ -434,6 +446,10 @@ public:
+         }
+         if (d_pool) cudaFree(d_pool);
+         if (d_physical_ids) cudaFree(d_physical_ids);
++        if (d_page_table) cudaFree(d_page_table);
++        if (d_page_status) cudaFree(d_page_status);
++        if (h_page_table) cudaFreeHost(h_page_table);
++        if (h_page_status) cudaFreeHost(h_page_status);
+     }
+ 
+     void reset_cache_state() {
+@@ -446,6 +462,22 @@ public:
+         }
+     }
+ 
++    void sync_gpu_page_table_locked() {
++        if (!d_page_table || !h_page_table) return;
++        std::fill(h_page_table, h_page_table + total_experts, -1);
++        for (const CacheSlot & slot : slots) {
++            if (slot.logical_expert_id >= 0 && slot.logical_expert_id < total_experts) {
++                h_page_table[slot.logical_expert_id] = slot.physical_index;
++            }
++        }
++        CUDA_CHECK(cudaMemcpyAsync(
++            d_page_table,
++            h_page_table,
++            (size_t) total_experts * sizeof(int),
++            cudaMemcpyHostToDevice,
++            stream));
++    }
++
+     std::list<int>::iterator eviction_candidate() {
+         auto it = lru_list.end();
+         while (it != lru_list.begin()) {
+@@ -642,6 +674,7 @@ public:
+         capacity = new_capacity;
+         reset_cache_state();
+         if (ability_enabled) preload_ability_experts();
++        sync_gpu_page_table_locked();
+     }
+ 
+     void ensure_physical_ids_capacity_locked(int count) {
+@@ -773,6 +806,11 @@ public:
+             cudaEventCreateWithFlags(&physical_ids_events[i], cudaEventDisableTiming);
+         }
+ 
++        CUDA_CHECK(cudaMalloc(&d_page_table, (size_t) total_experts * sizeof(int)));
++        CUDA_CHECK(cudaMallocHost(&h_page_table, (size_t) total_experts * sizeof(int)));
++        CUDA_CHECK(cudaMalloc(&d_page_status, 2 * sizeof(unsigned long long)));
++        CUDA_CHECK(cudaMallocHost(&h_page_status, 2 * sizeof(unsigned long long)));
++
+         reset_cache_state();
+         ability_enabled = getenv("EVM_ABILITY_PACK_INDEX") != nullptr;
+         ability_pack_only = read_env_ll("EVM_ABILITY_PACK_ONLY", 0) != 0;
+@@ -788,9 +826,15 @@ public:
+             fprintf(stderr, "EVM: pinned %zu ability experts for tensor %s (pack_only=%d)\n",
+                     ability_experts.size(), vault_tensor_name.c_str(), ability_pack_only ? 1 : 0);
+         }
++        sync_gpu_page_table_locked();
+         
+         initialized = true;
+ 
++        if (getenv("EVM_GPU_PAGE_TABLE") != nullptr) {
++            fprintf(stderr, "EVM_GPU_PAGE_TABLE: tensor=%s experts=%d enabled=%d\n",
++                    tensor_name, total_experts, total_experts <= 64 ? 1 : 0);
++        }
++
+         if (source_from_vault) {
+             fprintf(stderr, "EVM: tensor %s is backed by the external expert vault\n", tensor_name);
+         }
+@@ -960,11 +1004,6 @@ public:
+         upload_physical_ids_locked(logical_ids, count);
+         needs_sync = true;
+         
+-        if (needs_sync) {
+-            cudaEventRecord(event, stream);
+-            cudaStreamWaitEvent(compute_stream, event, 0);
+-        }
+-
+         std::vector<int> current_ids;
+         current_ids.reserve(unique_ids.size());
+         for (const int logical : unique_ids) {
+@@ -972,6 +1011,12 @@ public:
+         }
+         last_routed_experts = current_ids;
+         queue_predictive_prefetch_locked(current_ids);
++        sync_gpu_page_table_locked();
++
++        if (needs_sync) {
++            cudaEventRecord(event, stream);
++            cudaStreamWaitEvent(compute_stream, event, 0);
++        }
+ 
+     }
+ 
+@@ -1110,6 +1155,7 @@ public:
+         upload_physical_ids_locked(physical_ids, count);
+         needs_sync = true;
+ 
++        sync_gpu_page_table_locked();
+         if (needs_sync) {
+             cudaEventRecord(event, stream);
+             cudaStreamWaitEvent(compute_stream, event, 0);
+@@ -1118,6 +1164,58 @@ public:
+     
+     char* get_pool() { return d_pool; }
+     int* get_physical_ids() { return d_physical_ids; }
++    int* get_page_table() { return d_page_table; }
++    unsigned long long* get_page_status() { return d_page_status; }
++    unsigned long long* get_host_page_status() { return h_page_status; }
++    int get_total_experts() const { return total_experts; }
++
++    bool gpu_page_table_enabled() const {
++        return initialized && total_experts <= 64 && read_env_ll("EVM_GPU_PAGE_TABLE", 0) != 0;
++    }
++
++    void prepare_gpu_page_mapping(int count) {
++        std::lock_guard<std::mutex> lock(mtx);
++        ensure_physical_ids_capacity_locked(count);
++    }
++
++    void record_gpu_page_hit(uint64_t active_mask, int count, cudaStream_t compute_stream) {
++        std::lock_guard<std::mutex> lock(mtx);
++        CUDA_CHECK(cudaEventRecord(pool_reuse_event, compute_stream));
++        CUDA_CHECK(cudaStreamWaitEvent(stream, pool_reuse_event, 0));
++        std::vector<int> current_ids;
++        for (int logical = 0; logical < total_experts; ++logical) {
++            if ((active_mask & (UINT64_C(1) << logical)) == 0) continue;
++            const auto it = cache_map.find(logical);
++            if (it == cache_map.end()) {
++                // A stale table is treated as a miss by the caller. This guard
++                // keeps the cache state conservative if a future caller races.
++                return;
++            }
++            const int physical = *(it->second);
++            lru_list.erase(it->second);
++            lru_list.push_front(physical);
++            cache_map[logical] = lru_list.begin();
++            expert_access_counts[(size_t) logical]++;
++            current_ids.push_back(logical);
++        }
++        if (metrics_enabled) metric_cache_hits += (uint64_t) count;
++        metric_gpu_page_hits++;
++        last_routed_experts = current_ids;
++        queue_predictive_prefetch_locked(current_ids);
++        sync_gpu_page_table_locked();
++        cudaEventRecord(event, stream);
++        cudaStreamWaitEvent(compute_stream, event, 0);
++    }
++
++    void record_gpu_page_miss() {
++        std::lock_guard<std::mutex> lock(mtx);
++        metric_gpu_page_misses++;
++    }
++
++    void record_gpu_page_attempt() {
++        std::lock_guard<std::mutex> lock(mtx);
++        metric_gpu_page_attempts++;
++    }
+ 
+     void write_profile(std::ofstream & profile, const char * prompt_id, const char * phase) {
+         std::lock_guard<std::mutex> lock(mtx);
+@@ -1140,6 +1238,9 @@ public:
+         metric_pack_substitutions = 0;
+         metric_predictor_prefetches = 0;
+         metric_predictor_hits = 0;
++        metric_gpu_page_hits = 0;
++        metric_gpu_page_misses = 0;
++        metric_gpu_page_attempts = 0;
+         prefetched_experts.clear();
+         last_routed_experts.clear();
+         if (read_env_ll("EVM_PREDICTOR_PERSIST", 0) == 0) {
+@@ -1171,6 +1272,9 @@ inline void print_all_stats() {
+     uint64_t total_pack_substitutions = 0;
+     uint64_t total_predictor_prefetches = 0;
+     uint64_t total_predictor_hits = 0;
++    uint64_t total_gpu_page_hits = 0;
++    uint64_t total_gpu_page_misses = 0;
++    uint64_t total_gpu_page_attempts = 0;
+ 
+     for (auto& pair : managers) {
+         if (!pair.second) continue;
+@@ -1181,6 +1285,9 @@ inline void print_all_stats() {
+         total_pack_substitutions += pair.second->metric_pack_substitutions;
+         total_predictor_prefetches += pair.second->metric_predictor_prefetches;
+         total_predictor_hits += pair.second->metric_predictor_hits;
++        total_gpu_page_hits += pair.second->metric_gpu_page_hits;
++        total_gpu_page_misses += pair.second->metric_gpu_page_misses;
++        total_gpu_page_attempts += pair.second->metric_gpu_page_attempts;
+     }
+ 
+     const uint64_t total = total_hits + total_misses;
+@@ -1197,6 +1304,9 @@ inline void print_all_stats() {
+     fprintf(stderr, "Pack Substitutions: %llu\n", (unsigned long long) total_pack_substitutions);
+     fprintf(stderr, "Predictor Prefetches: %llu\n", (unsigned long long) total_predictor_prefetches);
+     fprintf(stderr, "Predictor Hits   : %llu\n", (unsigned long long) total_predictor_hits);
++    fprintf(stderr, "GPU Page Hits    : %llu\n", (unsigned long long) total_gpu_page_hits);
++    fprintf(stderr, "GPU Page Misses  : %llu\n", (unsigned long long) total_gpu_page_misses);
++    fprintf(stderr, "GPU Page Attempts: %llu\n", (unsigned long long) total_gpu_page_attempts);
+ 
+     // Clear counters so later explicit calls and manager destructors do not double-report.
+     for (auto& pair : managers) {
+@@ -1208,6 +1318,9 @@ inline void print_all_stats() {
+         pair.second->metric_pack_substitutions = 0;
+         pair.second->metric_predictor_prefetches = 0;
+         pair.second->metric_predictor_hits = 0;
++        pair.second->metric_gpu_page_hits = 0;
++        pair.second->metric_gpu_page_misses = 0;
++        pair.second->metric_gpu_page_attempts = 0;
+     }
+     fflush(stderr);
+ }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0714b12e7..4a7aa9051 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1835,6 +1835,81 @@ static std::vector<int> ggml_cuda_evm_copy_ids_to_host(
+     return h_ids;
+ }
+ 
++// Cache-hit remapping is a tiny GPU operation.  The output is contiguous even
++// when the logical ID view has a row stride, matching the replacement view
++// used by mul_mat_id below.  A 64-bit activity mask is enough for the current
++// EVM model families (60 or 64 experts); a nonzero miss flag requests the
++// existing exact host service path before any expert kernel is dispatched.
++static __global__ void ggml_cuda_evm_map_ids_kernel(
++        const char * logical_ids,
++        size_t logical_row_stride,
++        int ids_per_token,
++        int count,
++        const int * page_table,
++        int total_experts,
++        int * physical_ids,
++        unsigned long long * status) {
++    const int index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index >= count) return;
++    const int row = index / ids_per_token;
++    const int col = index - row * ids_per_token;
++    const int logical = *(const int *) (logical_ids + (size_t) row * logical_row_stride + (size_t) col * sizeof(int));
++    if (logical < 0) {
++        physical_ids[index] = logical;
++        return;
++    }
++    if (logical >= total_experts) {
++        atomicExch((unsigned long long *) &status[1], 1ULL);
++        return;
++    }
++    atomicOr(&status[0], UINT64_C(1) << logical);
++    const int physical = page_table[logical];
++    if (physical < 0) {
++        atomicExch((unsigned long long *) &status[1], 1ULL);
++        return;
++    }
++    physical_ids[index] = physical;
++}
++
++static bool ggml_cuda_evm_try_gpu_page_remap(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * ids,
++        EVM::Manager * mgr,
++        int count) {
++    mgr->record_gpu_page_attempt();
++    if (!mgr->gpu_page_table_enabled() || ids->ne[0] <= 0 || count <= 0) {
++        return false;
++    }
++    mgr->prepare_gpu_page_mapping(count);
++    CUDA_CHECK(cudaMemsetAsync(mgr->get_page_status(), 0, 2 * sizeof(unsigned long long), ctx.stream()));
++    const int threads = 256;
++    const int blocks = (count + threads - 1) / threads;
++    ggml_cuda_evm_map_ids_kernel<<<blocks, threads, 0, ctx.stream()>>>(
++        (const char *) ids->data,
++        ids->nb[1],
++        (int) ids->ne[0],
++        count,
++        mgr->get_page_table(),
++        mgr->get_total_experts(),
++        mgr->get_physical_ids(),
++        mgr->get_page_status());
++    CUDA_CHECK(cudaGetLastError());
++    CUDA_CHECK(cudaMemcpyAsync(
++        mgr->get_host_page_status(),
++        mgr->get_page_status(),
++        2 * sizeof(unsigned long long),
++        cudaMemcpyDeviceToHost,
++        ctx.stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++    const unsigned long long * status = mgr->get_host_page_status();
++    if (status[1] != 0) {
++        mgr->record_gpu_page_miss();
++        return false;
++    }
++    mgr->record_gpu_page_hit(status[0], count, ctx.stream());
++    return true;
++}
++
+ static void ggml_cuda_evm_rewrite_tensor_views(
+         const ggml_tensor * original_src0,
+         EVM::Manager * mgr,
+@@ -1896,10 +1971,12 @@ static bool ggml_cuda_evm_remap_mul_mat_id(
+     EVM::Manager * mgr = ggml_cuda_evm_get_or_init_manager(src0);
+ 
+     int count = 0;
+-    std::vector<int> h_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
+-
+     mgr->update_phase(ids->ne[1]);
+-    mgr->ensure_experts(h_ids.data(), count, ctx.stream());
++    count = (int) (ids->ne[0] * ids->ne[1]);
++    if (!ggml_cuda_evm_try_gpu_page_remap(ctx, ids, mgr, count)) {
++        std::vector<int> h_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
++        mgr->ensure_experts(h_ids.data(), count, ctx.stream());
++    }
+ 
+     ggml_cuda_evm_rewrite_ids_view(ids, mgr, ids_copy, ids);
+     ggml_cuda_evm_rewrite_tensor_views(src0, mgr, src0_copy, src0);
+@@ -1929,10 +2006,9 @@ static bool ggml_cuda_evm_remap_fused_mul_mat_id(
+     EVM::Manager * gate_mgr = ggml_cuda_evm_get_or_init_manager(gate_src0);
+ 
+     int count = 0;
+-    std::vector<int> logical_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
+-
+     up_mgr->update_phase(ids->ne[1]);
+     gate_mgr->update_phase(ids->ne[1]);
++    std::vector<int> logical_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
+ 
+     std::unordered_map<int, int> logical_to_physical;
+     logical_to_physical.reserve((size_t) count);
+-- 
+2.43.0.windows.1
+

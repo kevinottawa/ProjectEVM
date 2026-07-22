@@ -1,0 +1,4 @@
+model,resident_expert_pct,generation_tps,peak_vram_mb,peak_rss_mb,end_rss_mb,pagefile_delta_mb,gpu_kv,gpu_pack_only,cpu_backing,valid
+Qwen1.5-MoE,37.5,65.7,4378,3521,1026,0,True,True,False,True
+DeepSeek-Coder-V2-Lite,37.5,32.4,5336,4451,1089,0,True,True,False,True
+Qwen2-57B-A14B,37.5,31.5,16412,15516,219,0,True,True,False,True

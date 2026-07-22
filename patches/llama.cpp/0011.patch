@@ -1,0 +1,167 @@
+From 4ca0c2fe78859bf3e1463afc4bcc1a1e952fde01 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 20:14:31 -0400
+Subject: [PATCH 11/26] Add bounded EVM disk staging controls
+
+---
+ ggml/src/ggml-cuda/evm.cuh      | 88 ++++++++++++++++++++++++++++-----
+ ggml/src/ggml-cuda/ggml-cuda.cu | 18 +++++++
+ 2 files changed, 94 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index c80cf810e..4016fc235 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -11,9 +11,61 @@
+ #include <memory>
+ #include <algorithm>
+ #include <cstdlib>
++#include <cstring>
+ 
+ namespace EVM {
+ 
++struct PinnedStageSlot {
++    char * data = nullptr;
++    cudaEvent_t ready = nullptr;
++    bool in_flight = false;
++};
++
++struct PinnedStagePool {
++    std::vector<PinnedStageSlot> slots;
++    size_t next = 0;
++};
++
++inline bool staged_h2d_copy(char * dst, const char * src, size_t bytes, cudaStream_t stream) {
++    if (getenv("EVM_DISK_STAGING") == nullptr) {
++        return false;
++    }
++
++    static std::mutex staging_mutex;
++    static std::unordered_map<size_t, std::unique_ptr<PinnedStagePool>> pools;
++    std::lock_guard<std::mutex> lock(staging_mutex);
++
++    auto & pool_ptr = pools[bytes];
++    if (!pool_ptr) {
++        pool_ptr = std::make_unique<PinnedStagePool>();
++        int slot_count = 4;
++        if (const char * value = getenv("EVM_DISK_STAGING_SLOTS")) {
++            slot_count = std::max(1, std::min(32, atoi(value)));
++        }
++        pool_ptr->slots.resize((size_t) slot_count);
++        for (PinnedStageSlot & slot : pool_ptr->slots) {
++            CUDA_CHECK(cudaMallocHost((void **) &slot.data, bytes));
++            CUDA_CHECK(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming));
++        }
++        fprintf(stderr,
++                "EVM: pinned disk staging active: expert_size=%.2f MB, slots=%d, host_budget=%.2f MB\n",
++                (double) bytes / (1024.0 * 1024.0),
++                slot_count,
++                (double) (bytes * (size_t) slot_count) / (1024.0 * 1024.0));
++    }
++
++    PinnedStagePool & pool = *pool_ptr;
++    PinnedStageSlot & slot = pool.slots[pool.next++ % pool.slots.size()];
++    if (slot.in_flight) {
++        CUDA_CHECK(cudaEventSynchronize(slot.ready));
++    }
++    std::memcpy(slot.data, src, bytes);
++    CUDA_CHECK(cudaMemcpyAsync(dst, slot.data, bytes, cudaMemcpyHostToDevice, stream));
++    CUDA_CHECK(cudaEventRecord(slot.ready, stream));
++    slot.in_flight = true;
++    return true;
++}
++
+ struct CacheSlot {
+     int physical_index;
+     int logical_expert_id;
+@@ -345,12 +397,18 @@ public:
+                 size_t offset = (size_t)log_id * expert_size_bytes;
+                 size_t dst_offset = (size_t)phys_idx * expert_size_bytes;
+                 
+-                CUDA_CHECK(cudaMemcpyAsync(
+-                    d_pool + dst_offset,
+-                    h_experts_mmap + offset,
+-                    expert_size_bytes,
+-                    source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+-                    stream));
++                if (source_on_device || !staged_h2d_copy(
++                        d_pool + dst_offset,
++                        h_experts_mmap + offset,
++                        (size_t) expert_size_bytes,
++                        stream)) {
++                    CUDA_CHECK(cudaMemcpyAsync(
++                        d_pool + dst_offset,
++                        h_experts_mmap + offset,
++                        expert_size_bytes,
++                        source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
++                        stream));
++                }
+                 if (metrics_enabled) {
+                     metric_bytes_transferred += expert_size_bytes;
+                 }
+@@ -456,12 +514,18 @@ public:
+             const size_t offset = (size_t) log_id * expert_size_bytes;
+             const size_t dst_offset = (size_t) phys_idx * expert_size_bytes;
+ 
+-            CUDA_CHECK(cudaMemcpyAsync(
+-                d_pool + dst_offset,
+-                h_experts_mmap + offset,
+-                expert_size_bytes,
+-                source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+-                stream));
++            if (source_on_device || !staged_h2d_copy(
++                    d_pool + dst_offset,
++                    h_experts_mmap + offset,
++                    (size_t) expert_size_bytes,
++                    stream)) {
++                CUDA_CHECK(cudaMemcpyAsync(
++                    d_pool + dst_offset,
++                    h_experts_mmap + offset,
++                    expert_size_bytes,
++                    source_on_device ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
++                    stream));
++            }
+             if (metrics_enabled) {
+                 metric_bytes_transferred += expert_size_bytes;
+             }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c8b7e4241..83fd0c978 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -94,6 +94,10 @@
+ #define NOMINMAX
+ #endif
+ #include <windows.h>
++#include <psapi.h>
++#if defined(_MSC_VER)
++#pragma comment(lib, "Psapi.lib")
++#endif
+ #endif
+ 
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+@@ -3991,8 +3995,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+             const char * value = getenv("EVM_DISK_TRIM_INTERVAL");
+             return value ? std::max<uint64_t>(1, strtoull(value, nullptr, 10)) : 1;
+         }();
++        static const SIZE_T trim_budget_bytes = [] {
++            const char * value = getenv("EVM_DISK_CACHE_MB");
++            return value ? (SIZE_T) strtoull(value, nullptr, 10) * 1024ULL * 1024ULL : (SIZE_T) 0;
++        }();
+         if ((trim_counter.fetch_add(1, std::memory_order_relaxed) + 1) % trim_interval == 0) {
+             auto trim_working_set = [](void *) {
++                if (trim_budget_bytes > 0) {
++                    PROCESS_MEMORY_COUNTERS_EX counters{};
++                    counters.cb = sizeof(counters);
++                    if (GetProcessMemoryInfo(
++                            GetCurrentProcess(),
++                            reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&counters),
++                            sizeof(counters)) && counters.WorkingSetSize <= trim_budget_bytes) {
++                        return;
++                    }
++                }
+                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
+             };
+             CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), trim_working_set, nullptr));
+-- 
+2.43.0.windows.1
+

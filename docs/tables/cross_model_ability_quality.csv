@@ -1,0 +1,9 @@
+model,mode,resident_expert_pct,passed,total,retained_baseline_passes,baseline_pass_opportunities
+Qwen1.5-MoE,baseline,100,5,5,,
+Qwen1.5-MoE,pack_only,25.0,1,5,1,5
+Qwen1.5-MoE,pack_only,37.5,3,5,3,5
+DeepSeek-Coder-V2-Lite,baseline,100,5,5,,
+DeepSeek-Coder-V2-Lite,pack_only,25.0,0,5,0,5
+DeepSeek-Coder-V2-Lite,pack_only,37.5,0,5,0,5
+Qwen2-57B-A14B,pack_only,25.0,4,5,,
+Qwen2-57B-A14B,pack_only,37.5,5,5,,

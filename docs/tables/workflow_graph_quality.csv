@@ -1,0 +1,4 @@
+model,baseline_mode,baseline_passed,total,frequency,graph
+Qwen1.5-MoE,native_full_model,5,8,"{'passed': 2, 'retained_baseline_passes': 2, 'baseline_opportunities': 5}","{'passed': 2, 'retained_baseline_passes': 1, 'baseline_opportunities': 5}"
+DeepSeek-Coder-V2-Lite,native_full_model,4,8,"{'passed': 1, 'retained_baseline_passes': 1, 'baseline_opportunities': 4}","{'passed': 2, 'retained_baseline_passes': 2, 'baseline_opportunities': 4}"
+Qwen2-57B-A14B,exact_external_vault,5,8,"{'passed': 6, 'retained_baseline_passes': 4, 'baseline_opportunities': 5}","{'passed': 5, 'retained_baseline_passes': 4, 'baseline_opportunities': 5}"

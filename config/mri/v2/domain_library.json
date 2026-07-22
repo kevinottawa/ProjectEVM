@@ -1,0 +1,168 @@
+{
+  "format": "evm-mri-domain-library-v2",
+  "version": "2.0.0",
+  "description": "Hierarchical controlled payload library for MoE routing association, workload-pack construction, and held-out validation.",
+  "groups": {
+    "computer_agent": "Software development, tool use, planning, and machine-readable work",
+    "professional_reasoning": "Scientific, mathematical, business, research, legal-style, medical-style, and financial reasoning",
+    "language_human": "Instruction following, safety, conversation, creative language, multilingual work, and factual recall"
+  },
+  "domains": {
+    "code_generation": {
+      "group": "computer_agent", "description": "Implement code from an explicit behavioral specification", "excludes": "Debugging or reviewing existing code", "contrast_domains": ["debugging", "code_review"],
+      "calibration": ["Implement a Python function that returns unique strings while preserving order.", "Write a C++ function that performs binary search on a sorted vector.", "Implement a JavaScript debounce function with a configurable delay.", "Write SQL that returns each customer's latest order."],
+      "validation": ["Implement a Python context manager that measures elapsed time."],
+      "held_out": ["Write a Rust function that counts words without allocating lowercase copies."]
+    },
+    "debugging": {
+      "group": "computer_agent", "description": "Diagnose and repair faulty program behavior", "excludes": "Greenfield implementation or style-only review", "contrast_domains": ["code_generation", "code_review"],
+      "calibration": ["A C++ program dereferences a null pointer after a failed lookup. Explain the fix.", "A Python loop skips items while deleting from the same list. Diagnose it.", "A JavaScript promise rejection is silently lost. Give a debugging path.", "A SQL join unexpectedly duplicates rows. Identify likely causes."],
+      "validation": ["A multithreaded counter intermittently loses increments. Diagnose the defect."],
+      "held_out": ["A recursive parser overflows only on deeply nested input. Propose a repair."]
+    },
+    "code_review": {
+      "group": "computer_agent", "description": "Inspect existing code for correctness, security, performance, and maintainability", "excludes": "Implementing a new feature", "contrast_domains": ["debugging", "systems_programming"],
+      "calibration": ["Review a function that concatenates SQL using user input and identify the primary defect.", "Review a loop with an inclusive upper bound over a fixed-size array.", "Review a cache that has no eviction limit and explain the operational risk.", "Review an API handler that logs full authorization headers."],
+      "validation": ["Review a file-upload handler that trusts the supplied filename."],
+      "held_out": ["Review a retry loop with no deadline or jitter."]
+    },
+    "systems_programming": {
+      "group": "computer_agent", "description": "Reason about C, C++, CUDA, memory, concurrency, and operating-system interfaces", "excludes": "General application coding", "contrast_domains": ["code_generation", "debugging"],
+      "calibration": ["Explain acquire and release memory ordering with a producer-consumer example.", "Explain why an asynchronous CUDA copy requires source-lifetime coordination.", "Compare mmap with explicit buffered reads for a large immutable file.", "Explain false sharing and one way to reduce it."],
+      "validation": ["Describe how to safely reuse a pinned host staging buffer after cudaMemcpyAsync."],
+      "held_out": ["Explain when a lock-free structure can suffer the ABA problem."]
+    },
+    "web_development": {
+      "group": "computer_agent", "description": "Build and reason about browser interfaces, web APIs, state, and accessibility", "excludes": "Generic programming without web behavior", "contrast_domains": ["code_generation", "technical_writing"],
+      "calibration": ["Explain how to prevent layout shift while an image loads.", "Design an accessible modal focus cycle.", "Explain the difference between HTTP 401 and 403.", "Describe how optimistic UI should recover from a failed mutation."],
+      "validation": ["Explain why a controlled form input can become uneditable in React."],
+      "held_out": ["Design cache headers for a fingerprinted static asset."]
+    },
+    "data_scripting": {
+      "group": "computer_agent", "description": "Transform structured data using Python, SQL, shell tools, and statistics", "excludes": "General code generation without a data task", "contrast_domains": ["structured_output", "mathematics"],
+      "calibration": ["Describe a pandas workflow to group sales by month and region.", "Write SQL logic to compute a seven-day moving average.", "Explain how to stream a large JSONL file without loading it fully.", "Describe how to detect duplicate composite keys in a CSV."],
+      "validation": ["Explain how to join two datasets while preserving unmatched left rows."],
+      "held_out": ["Design a script that validates and normalizes timestamps from mixed time zones."]
+    },
+    "tool_calling": {
+      "group": "computer_agent", "description": "Select tools, construct valid arguments, interpret results, and recover from tool errors", "excludes": "Planning without an external action", "contrast_domains": ["planning", "structured_output"],
+      "calibration": ["Choose between a file search and web search to locate a symbol in a local repository, then state the arguments.", "Given a weather tool schema, construct arguments for tomorrow's Toronto forecast.", "A database tool rejects an unknown column. Describe the next tool action.", "Choose the minimum tool calls needed to inspect three independent files."],
+      "validation": ["A tool returns a timeout after performing a write. Explain how to recover without duplicating the action."],
+      "held_out": ["Select tools and arguments to compare two local benchmark JSON files."]
+    },
+    "planning": {
+      "group": "computer_agent", "description": "Decompose objectives, order dependencies, track progress, and revise execution plans", "excludes": "Executing tools or writing implementation details", "contrast_domains": ["tool_calling", "business_operations"],
+      "calibration": ["Plan a safe database schema migration with rollback and verification.", "Break a compiler upgrade into dependency-ordered steps.", "Plan a benchmark that separates memory, speed, and quality claims.", "Revise a project plan after its integration test fails."],
+      "validation": ["Plan a staged rollout for a new inference runtime."],
+      "held_out": ["Create a dependency-aware plan to split a monolith into two services."]
+    },
+    "structured_output": {
+      "group": "computer_agent", "description": "Produce exact schemas, JSON, tables, manifests, and constrained formats", "excludes": "Unconstrained prose", "contrast_domains": ["tool_calling", "instruction_following"],
+      "calibration": ["Return JSON with keys name, version, and enabled, using valid JSON only.", "Represent three benchmark rows as CSV with a header.", "Create a JSON Schema for an object with a required integer capacity.", "Return a Markdown table with columns model, speed, and memory."],
+      "validation": ["Produce a YAML list of two services with name and port fields."],
+      "held_out": ["Return newline-delimited JSON for two pass/fail test records."]
+    },
+    "repository_navigation": {
+      "group": "computer_agent", "description": "Locate code ownership and connect behavior across repository modules", "excludes": "Reviewing code already supplied", "contrast_domains": ["code_review", "planning"],
+      "calibration": ["Describe how to find where a command-line flag is parsed and consumed in a repository.", "Plan a symbol search from an API endpoint to its database query.", "Explain how to identify all tests covering a configuration key.", "Describe how to trace a generated file back to its source script."],
+      "validation": ["Explain how to find callers of a function before changing its signature."],
+      "held_out": ["Describe how to locate the build option controlling a CUDA feature."]
+    },
+    "technical_writing": {
+      "group": "professional_reasoning", "description": "Write documentation, specifications, reports, and precise explanations", "excludes": "Creative prose or research comparison", "contrast_domains": ["research_synthesis", "creative_writing"],
+      "calibration": ["Write a concise API deprecation notice with migration steps.", "Explain a cache hit rate to an engineering manager.", "Draft acceptance criteria for a memory-budget feature.", "Summarize a benchmark without overstating causality."],
+      "validation": ["Write a short operational runbook for restarting a failed worker."],
+      "held_out": ["Explain logical-to-physical remapping to a software engineer unfamiliar with MoE."]
+    },
+    "business_operations": {
+      "group": "professional_reasoning", "description": "Reason about requirements, process design, project coordination, and operational decisions", "excludes": "Financial calculation or technical implementation", "contrast_domains": ["planning", "financial_analysis"],
+      "calibration": ["Turn a vague request for faster support into measurable requirements.", "Design an escalation process for repeated service outages.", "Compare build-versus-buy factors for an internal tool.", "Create decision criteria for prioritizing two roadmap items."],
+      "validation": ["Identify stakeholders and risks for changing a billing workflow."],
+      "held_out": ["Design a lightweight change-approval process for a small engineering team."]
+    },
+    "scientific_reasoning": {
+      "group": "professional_reasoning", "description": "Form hypotheses, reason causally, and design controlled experiments", "excludes": "Simple scientific fact recall", "contrast_domains": ["factual_recall", "research_synthesis"],
+      "calibration": ["Design an experiment to test whether prefetching improves throughput.", "Distinguish correlation from causation in an observational result.", "Identify confounders in a comparison of two inference modes.", "Explain why repeated trials need variance reporting."],
+      "validation": ["Propose controls for measuring whether a cache policy saves memory."],
+      "held_out": ["Design an ablation that tests whether selected experts are causally important."]
+    },
+    "mathematics": {
+      "group": "professional_reasoning", "description": "Perform arithmetic, algebra, probability, geometry, and symbolic reasoning", "excludes": "Scientific experimental design", "contrast_domains": ["formal_logic", "financial_analysis"],
+      "calibration": ["Solve 3x + 5 = 20 and show the algebra.", "Compute the probability of two heads in two fair coin flips.", "Find the area of a circle with radius 3.", "Simplify (x squared minus 9) divided by (x minus 3)."],
+      "validation": ["Solve a two-equation linear system with one unique solution."],
+      "held_out": ["Compute the expected value of a fair six-sided die."]
+    },
+    "formal_logic": {
+      "group": "professional_reasoning", "description": "Apply symbolic, deductive, and constraint-based reasoning", "excludes": "Numerical calculation", "contrast_domains": ["mathematics", "planning"],
+      "calibration": ["If all A are B and no B are C, determine whether any A can be C.", "Evaluate the validity of affirming the consequent.", "Given exactly one of P or Q is true and P is false, infer Q.", "Determine whether two stated constraints can both hold."],
+      "validation": ["Translate a necessary-but-not-sufficient condition into logic."],
+      "held_out": ["Identify the contradiction in a short set of propositions."]
+    },
+    "research_synthesis": {
+      "group": "professional_reasoning", "description": "Compare evidence, identify disagreement, and form qualified conclusions", "excludes": "Unsourced factual recall or original experimentation", "contrast_domains": ["technical_writing", "scientific_reasoning"],
+      "calibration": ["Synthesize two studies that report different benchmark outcomes.", "Separate measured findings from author interpretation in a paper summary.", "Explain how publication date and methodology affect evidence weight.", "Write a qualified conclusion from mixed experimental results."],
+      "validation": ["Compare an observational study with a randomized experiment."],
+      "held_out": ["Summarize agreement and disagreement across three hypothetical sources."]
+    },
+    "legal_style_reasoning": {
+      "group": "professional_reasoning", "description": "Interpret rules, exceptions, obligations, and fact patterns without providing legal certification", "excludes": "Jurisdiction-specific legal advice", "contrast_domains": ["formal_logic", "business_operations"],
+      "calibration": ["Apply a stated rule and exception to a hypothetical fact pattern.", "Separate a contractual obligation from a recommendation.", "Identify an ambiguity in a policy definition.", "Explain why jurisdiction and effective date matter when applying a rule."],
+      "validation": ["Compare mandatory and discretionary language in two clauses."],
+      "held_out": ["Analyze whether a hypothetical exception applies under a supplied rule."]
+    },
+    "medical_style_reasoning": {
+      "group": "professional_reasoning", "description": "Handle symptom uncertainty, triage language, and safety escalation without diagnosing", "excludes": "Personal diagnosis or treatment prescription", "contrast_domains": ["scientific_reasoning", "safety_refusal"],
+      "calibration": ["Explain when chest pain requires urgent professional evaluation.", "List clarifying questions for a vague symptom report without diagnosing.", "Distinguish general health information from personalized medical advice.", "Explain why medication interactions require a pharmacist or clinician."],
+      "validation": ["Respond safely to a report of sudden weakness on one side."],
+      "held_out": ["Explain uncertainty and escalation for a persistent high fever."]
+    },
+    "financial_analysis": {
+      "group": "professional_reasoning", "description": "Reason about accounting, percentages, cash flow, risk, and financial comparisons", "excludes": "Personalized investment recommendations", "contrast_domains": ["mathematics", "business_operations"],
+      "calibration": ["Calculate gross margin from revenue and cost of goods sold.", "Explain the difference between profit and cash flow.", "Compare fixed and variable costs in a break-even analysis.", "Explain why diversification changes portfolio risk but not expected guarantees."],
+      "validation": ["Compute percentage growth between two annual revenue values."],
+      "held_out": ["Explain how discount rate affects net present value."]
+    },
+    "instruction_following": {
+      "group": "language_human", "description": "Follow exact content, format, length, and multi-step constraints", "excludes": "Safety refusal or schema-specific output", "contrast_domains": ["structured_output", "safety_refusal"],
+      "calibration": ["Reply with exactly three words describing careful engineering.", "Give two bullet points and no introductory sentence.", "Explain caching without using the word memory.", "Return one sentence containing both latency and throughput."],
+      "validation": ["Answer in exactly ten words and include the word evidence."],
+      "held_out": ["Provide three numbered steps, each containing one verb."]
+    },
+    "safety_refusal": {
+      "group": "language_human", "description": "Refuse unsafe or dishonest requests while preserving useful benign assistance", "excludes": "General instruction following", "contrast_domains": ["instruction_following", "medical_style_reasoning"],
+      "calibration": ["Politely refuse to invent a citation and suggest verification.", "Refuse to provide stolen credentials and recommend account recovery.", "Decline to fabricate benchmark data and propose a real test.", "Refuse a request to hide a known safety defect from users."],
+      "validation": ["Decline to impersonate a real person for fraud and offer a benign alternative."],
+      "held_out": ["Refuse to falsify an audit record while suggesting a correction process."]
+    },
+    "conversation_support": {
+      "group": "language_human", "description": "Recognize intent, clarify ambiguity, maintain tone, and provide emotionally appropriate support", "excludes": "Clinical counseling or creative roleplay", "contrast_domains": ["instruction_following", "creative_writing"],
+      "calibration": ["Respond empathetically to someone frustrated by a failed project.", "Ask one useful clarification for an ambiguous travel request.", "Rephrase a blunt correction in a respectful tone.", "Acknowledge uncertainty without becoming dismissive."],
+      "validation": ["Respond to a user who feels overwhelmed by a large task."],
+      "held_out": ["Clarify whether 'bank' means a financial institution or river edge."]
+    },
+    "creative_writing": {
+      "group": "language_human", "description": "Produce narrative, dialogue, imagery, style transformation, and ideation", "excludes": "Technical documentation", "contrast_domains": ["technical_writing", "conversation_support"],
+      "calibration": ["Write a four-line story about a city during a power outage.", "Describe moonlight once literally and once metaphorically.", "Write dialogue that implies disagreement without stating it directly.", "Generate three distinct premises for a mystery story."],
+      "validation": ["Rewrite a plain weather sentence in a noir style."],
+      "held_out": ["Write a brief scene where a character changes their mind silently."]
+    },
+    "multilingual_work": {
+      "group": "language_human", "description": "Translate and reason across languages while preserving meaning and register", "excludes": "English-only factual recall", "contrast_domains": ["factual_recall", "conversation_support"],
+      "calibration": ["Translate 'The test passed, but the result needs review' into French.", "Explain the difference between formal and informal second-person address in French.", "Translate a short Spanish scheduling request into English.", "Preserve a polite register while translating an English request into German."],
+      "validation": ["Translate a concise technical warning from English into French."],
+      "held_out": ["Explain an ambiguity that can arise when translating pronouns into English."]
+    },
+    "factual_recall": {
+      "group": "language_human", "description": "Recall common historical, geographic, scientific, and cultural facts", "excludes": "Causal scientific reasoning or research synthesis", "contrast_domains": ["scientific_reasoning", "research_synthesis"],
+      "calibration": ["State the capital of France.", "Give the chemical formula for water.", "Name the largest planet in the solar system.", "Identify the author of Pride and Prejudice."],
+      "validation": ["State the continent containing Kenya."],
+      "held_out": ["Name the process by which plants convert light into chemical energy."]
+    },
+    "long_context_synthesis": {
+      "group": "language_human", "description": "Retrieve and combine evidence distributed across a long supplied context", "excludes": "Recall from model parameters alone", "contrast_domains": ["research_synthesis", "instruction_following"],
+      "calibration": ["Given a long report with requirements at the beginning and test results at the end, reconcile them.", "Combine two distant passages to identify an unresolved dependency.", "Track a renamed entity across multiple sections of a document.", "Summarize only claims supported by supplied excerpts from different sections."],
+      "validation": ["Find a contradiction between an early specification and a later appendix."],
+      "held_out": ["Use evidence from three separated passages to produce one qualified conclusion."]
+    }
+  }
+}

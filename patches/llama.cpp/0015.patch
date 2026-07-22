@@ -1,0 +1,313 @@
+From b3ddf03a0c6c0836a7847c99f5ec493cfd736b86 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Sun, 12 Jul 2026 10:47:31 -0400
+Subject: [PATCH 15/26] Add persistent EVM batch profiler
+
+---
+ examples/CMakeLists.txt                       |   1 +
+ examples/evm-batch-profiler/CMakeLists.txt    |   8 +
+ .../evm-batch-profiler/evm-batch-profiler.cpp | 167 ++++++++++++++++++
+ ggml/include/ggml-cuda.h                      |   3 +
+ ggml/src/ggml-cuda/evm.cuh                    |  45 +++++
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   9 +
+ 6 files changed, 233 insertions(+)
+ create mode 100644 examples/evm-batch-profiler/CMakeLists.txt
+ create mode 100644 examples/evm-batch-profiler/evm-batch-profiler.cpp
+
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index be53d8a98..f5a553bcc 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -43,4 +43,5 @@ else()
+     endif()
+     add_subdirectory(routing-observatory)
+     add_subdirectory(evm-vault-parity)
++    add_subdirectory(evm-batch-profiler)
+ endif()
+diff --git a/examples/evm-batch-profiler/CMakeLists.txt b/examples/evm-batch-profiler/CMakeLists.txt
+new file mode 100644
+index 000000000..f933ec995
+--- /dev/null
++++ b/examples/evm-batch-profiler/CMakeLists.txt
+@@ -0,0 +1,8 @@
++set(TARGET llama-evm-batch-profiler)
++add_executable(${TARGET} evm-batch-profiler.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama llama-common ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
++if(TARGET BUILD_INFO)
++  add_dependencies(${TARGET} BUILD_INFO)
++endif()
+diff --git a/examples/evm-batch-profiler/evm-batch-profiler.cpp b/examples/evm-batch-profiler/evm-batch-profiler.cpp
+new file mode 100644
+index 000000000..3e271ae28
+--- /dev/null
++++ b/examples/evm-batch-profiler/evm-batch-profiler.cpp
+@@ -0,0 +1,167 @@
++#include "llama.h"
++#include "ggml-cuda.h"
++#include <nlohmann/json.hpp>
++
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++using json = nlohmann::ordered_json;
++
++struct prompt_row {
++    std::string id;
++    std::string domain;
++    std::string split;
++    std::string prompt;
++};
++
++static bool arg_value(int argc, char ** argv, const char * flag, std::string & value) {
++    for (int i = 1; i + 1 < argc; ++i) {
++        if (std::strcmp(argv[i], flag) == 0) {
++            value = argv[i + 1];
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool has_flag(int argc, char ** argv, const char * flag) {
++    for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], flag) == 0) return true;
++    return false;
++}
++
++static uint64_t fingerprint_token(uint64_t hash, llama_token token) {
++    const uint32_t value = static_cast<uint32_t>(token);
++    for (int byte = 0; byte < 4; ++byte) {
++        hash ^= (value >> (byte * 8)) & 0xffU;
++        hash *= 1099511628211ULL;
++    }
++    return hash;
++}
++
++static std::vector<prompt_row> load_manifest(const std::string & path) {
++    std::ifstream input(path);
++    json suite = json::parse(input);
++    std::vector<prompt_row> rows;
++    const std::string split = suite.value("split", "calibration");
++    for (auto & item : suite["domains"].items()) {
++        int index = 0;
++        for (const auto & prompt : item.value()["prompts"]) {
++            ++index;
++            rows.push_back({item.key() + "." + split + "." + std::to_string(index), item.key(), split, prompt.get<std::string>()});
++        }
++    }
++    return rows;
++}
++
++static std::unordered_set<std::string> load_checkpoint(const std::string & path) {
++    std::unordered_set<std::string> completed;
++    std::ifstream input(path);
++    std::string line;
++    while (std::getline(input, line)) if (!line.empty()) completed.insert(line);
++    return completed;
++}
++
++int main(int argc, char ** argv) {
++    std::string model_path, manifest_path, profile_path, rows_path, checkpoint_path, value;
++    if (!arg_value(argc, argv, "-m", model_path) ||
++        !arg_value(argc, argv, "--manifest", manifest_path) ||
++        !arg_value(argc, argv, "--profile", profile_path) ||
++        !arg_value(argc, argv, "--rows", rows_path) ||
++        !arg_value(argc, argv, "--checkpoint", checkpoint_path)) {
++        std::fprintf(stderr, "required: -m MODEL --manifest JSON --profile JSONL --rows JSONL --checkpoint TXT\n");
++        return 2;
++    }
++    int n_predict = 8, n_ctx = 512, n_gpu_layers = 99;
++    if (arg_value(argc, argv, "-n", value)) n_predict = std::stoi(value);
++    if (arg_value(argc, argv, "-c", value)) n_ctx = std::stoi(value);
++    if (arg_value(argc, argv, "-ngl", value)) n_gpu_layers = std::stoi(value);
++    const bool cold_experts = has_flag(argc, argv, "--cold-experts");
++
++    const auto prompts = load_manifest(manifest_path);
++    auto completed = load_checkpoint(checkpoint_path);
++    std::ofstream rows(rows_path, std::ios::app);
++    std::ofstream checkpoint(checkpoint_path, std::ios::app);
++    if (!rows || !checkpoint) return 3;
++
++    llama_backend_init();
++    llama_model_params model_params = llama_model_default_params();
++    model_params.n_gpu_layers = n_gpu_layers;
++    llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
++    if (!model) return 4;
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    llama_context_params context_params = llama_context_default_params();
++    context_params.n_ctx = n_ctx;
++    context_params.n_batch = n_ctx;
++    context_params.n_ubatch = 1;
++    context_params.no_perf = true;
++    llama_context * context = llama_init_from_model(model, context_params);
++    if (!context) return 5;
++    auto sampler_params = llama_sampler_chain_default_params();
++    sampler_params.no_perf = true;
++    llama_sampler * sampler = llama_sampler_chain_init(sampler_params);
++    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
++
++    int passed = 0, skipped = 0, failed = 0;
++    for (const prompt_row & item : prompts) {
++        if (completed.count(item.id)) {
++            ++skipped;
++            continue;
++        }
++        llama_memory_clear(llama_get_memory(context), true);
++        llama_sampler_reset(sampler);
++        ggml_backend_cuda_evm_reset(cold_experts);
++        const int token_count = -llama_tokenize(vocab, item.prompt.c_str(), item.prompt.size(), nullptr, 0, true, true);
++        bool valid = token_count > 0 && token_count + n_predict <= n_ctx;
++        std::vector<llama_token> tokens(valid ? token_count : 0);
++        if (valid) valid = llama_tokenize(vocab, item.prompt.c_str(), item.prompt.size(), tokens.data(), token_count, true, true) >= 0;
++        const auto started = std::chrono::steady_clock::now();
++        auto generation_started = started;
++        int generated = 0;
++        uint64_t fingerprint = 1469598103934665603ULL;
++        if (valid) {
++            llama_batch batch = llama_batch_get_one(tokens.data(), token_count);
++            valid = llama_decode(context, batch) == 0;
++            llama_synchronize(context);
++            valid = valid && ggml_backend_cuda_evm_profile_snapshot(profile_path.c_str(), item.id.c_str(), "prefill", true);
++            generation_started = std::chrono::steady_clock::now();
++        }
++        for (int step = 0; valid && step < n_predict; ++step) {
++            llama_token token = llama_sampler_sample(sampler, context, -1);
++            if (llama_vocab_is_eog(vocab, token)) break;
++            llama_sampler_accept(sampler, token);
++            fingerprint = fingerprint_token(fingerprint, token);
++            ++generated;
++            llama_batch batch = llama_batch_get_one(&token, 1);
++            if (llama_decode(context, batch) != 0) valid = false;
++        }
++        llama_synchronize(context);
++        valid = ggml_backend_cuda_evm_profile_snapshot(profile_path.c_str(), item.id.c_str(), "generation", true) && valid;
++        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
++        const double generation_elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_started).count();
++        rows << json({{"prompt_id", item.id}, {"domain", item.domain}, {"split", item.split}, {"valid", valid},
++                     {"prompt_tokens", token_count}, {"generated_tokens", generated}, {"elapsed_s", elapsed},
++                     {"generation_elapsed_s", generation_elapsed}, {"generation_tps", generation_elapsed > 0 ? generated / generation_elapsed : 0},
++                     {"token_fingerprint_fnv1a64", std::to_string(fingerprint)}, {"cold_experts", cold_experts}}).dump() << '\n';
++        rows.flush();
++        if (valid) {
++            checkpoint << item.id << '\n';
++            checkpoint.flush();
++            completed.insert(item.id);
++            ++passed;
++        } else {
++            ++failed;
++        }
++    }
++
++    llama_sampler_free(sampler);
++    llama_free(context);
++    llama_model_free(model);
++    llama_backend_free();
++    std::printf("Batch MRI: %d passed | %d skipped | %d failed | %s\n", passed, skipped, failed, failed ? "FAIL" : "PASS");
++    return failed ? 1 : 0;
++}
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index ac31a8220..92ea2b653 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -23,6 +23,9 @@ extern "C" {
+ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
+ GGML_BACKEND_API void ggml_backend_cuda_print_evm_stats(void);
++GGML_BACKEND_API bool ggml_backend_cuda_evm_profile_snapshot(
++        const char * path, const char * prompt_id, const char * phase, bool reset_counters);
++GGML_BACKEND_API void ggml_backend_cuda_evm_reset(bool reset_expert_cache);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 660360dbc..f455b8577 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -887,6 +887,31 @@ public:
+     
+     char* get_pool() { return d_pool; }
+     int* get_physical_ids() { return d_physical_ids; }
++
++    void write_profile(std::ofstream & profile, const char * prompt_id, const char * phase) {
++        std::lock_guard<std::mutex> lock(mtx);
++        profile << "{\"prompt_id\":\"" << prompt_id << "\",\"phase\":\"" << phase
++                << "\",\"tensor\":\"" << vault_tensor_name << "\",\"counts\":[";
++        for (size_t i = 0; i < expert_access_counts.size(); ++i) {
++            if (i) profile << ',';
++            profile << expert_access_counts[i];
++        }
++        profile << "]}\n";
++    }
++
++    void reset_observation(bool reset_expert_cache) {
++        std::lock_guard<std::mutex> lock(mtx);
++        std::fill(expert_access_counts.begin(), expert_access_counts.end(), 0);
++        metric_cache_hits = 0;
++        metric_cache_misses = 0;
++        metric_evictions = 0;
++        metric_bytes_transferred = 0;
++        metric_pack_substitutions = 0;
++        if (reset_expert_cache && !ability_pack_only) {
++            reset_cache_state();
++            if (ability_enabled) preload_ability_experts();
++        }
++    }
+ };
+ 
+ inline std::unordered_map<const ggml_tensor*, std::shared_ptr<Manager>>& get_managers_map() {
+@@ -941,6 +966,26 @@ inline void print_all_stats() {
+     fflush(stderr);
+ }
+ 
++inline bool write_profile_snapshot(const char * path, const char * prompt_id, const char * phase, bool reset_counters) {
++    if (!path || !*path || !prompt_id || !phase) return false;
++    std::lock_guard<std::mutex> lock(get_managers_mutex());
++    std::ofstream profile(path, std::ios::app);
++    if (!profile) return false;
++    for (auto & pair : get_managers_map()) {
++        if (!pair.second) continue;
++        pair.second->write_profile(profile, prompt_id, phase);
++        if (reset_counters) pair.second->reset_observation(false);
++    }
++    return profile.good();
++}
++
++inline void reset_all(bool reset_expert_cache) {
++    std::lock_guard<std::mutex> lock(get_managers_mutex());
++    for (auto & pair : get_managers_map()) {
++        if (pair.second) pair.second->reset_observation(reset_expert_cache);
++    }
++}
++
+ inline Manager* get_manager(const ggml_tensor* t) {
+     auto& managers = get_managers_map();
+     std::lock_guard<std::mutex> lock(get_managers_mutex());
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 79910224b..0714b12e7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5182,6 +5182,15 @@ GGML_BACKEND_API void ggml_backend_cuda_print_evm_stats(void) {
+     EVM::print_all_stats();
+ }
+ 
++GGML_BACKEND_API bool ggml_backend_cuda_evm_profile_snapshot(
++        const char * path, const char * prompt_id, const char * phase, bool reset_counters) {
++    return EVM::write_profile_snapshot(path, prompt_id, phase, reset_counters);
++}
++
++GGML_BACKEND_API void ggml_backend_cuda_evm_reset(bool reset_expert_cache) {
++    EVM::reset_all(reset_expert_cache);
++}
++
+ ggml_backend_t ggml_backend_cuda_init(int device) {
+     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+-- 
+2.43.0.windows.1
+

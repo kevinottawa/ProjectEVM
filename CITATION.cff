@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software or the accompanying study, please cite it."
+title: "EVM: Expert Virtual Memory for Mixture-of-Experts Inference"
+version: "1.0.0"
+date-released: 2026-07-21
+authors:
+  - family-names: Price
+    given-names: Kevin
+repository-code: "https://github.com/kevinottawa/ProjectEVM"
+license: MIT
+keywords:
+  - mixture-of-experts
+  - llama.cpp
+  - CUDA
+  - GPU memory
+  - local inference

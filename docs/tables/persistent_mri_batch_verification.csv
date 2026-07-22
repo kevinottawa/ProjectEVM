@@ -1,0 +1,2 @@
+model,prompts,isolated_process_wall_s,persistent_process_wall_s,wall_speedup,valid_prompts,routing_rows,membership_edges,coactivation_edges,prefill_generation_split,cold_experts
+Qwen1.5-MoE,26,170.18,15.91,10.7,26,3744,4799,3378,True,True

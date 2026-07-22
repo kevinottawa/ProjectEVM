@@ -1,0 +1,4 @@
+model,prompts,valid_prompts,wall_time_s,generation_tps,routing_rows,membership_edges,raw_coactivation_edges,refined_coactivation_edges
+Qwen1.5-MoE,2600,2600,2297.85,35.13,374400,12939,37904,4426
+DeepSeek-Coder-V2-Lite,2600,2600,2679.69,32.01,405600,11511,26056,3989
+Qwen2-57B-A14B,2600,2600,22267.42,3.28,436800,13437,35894,3657

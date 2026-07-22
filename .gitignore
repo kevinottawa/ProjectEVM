@@ -1,0 +1,30 @@
+# Large local artifacts
+models/
+venv/
+logs/
+*.log
+out.txt
+out_test.txt
+
+# Build outputs
+llama.cpp/
+llama.cpp/build/
+llama.cpp/.cache/
+llama.cpp/**/CMakeFiles/
+llama.cpp/**/cmake_install.cmake
+llama.cpp/**/*.vcxproj.user
+simulator/build/
+
+# Generated caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Benchmark outputs that are regenerated from scripts
+results/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak

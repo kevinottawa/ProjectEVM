@@ -1,0 +1,38 @@
+From 04434016fc6da0aa7e0603b9c81042541c94808b Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Thu, 9 Jul 2026 16:28:16 -0400
+Subject: [PATCH 03/26] Harden EVM remapped CUDA tensor metadata
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 1 +
+ ggml/src/ggml-cuda/mmvq.cu      | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3ea493648..69954bb0b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1841,6 +1841,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+         src0_copy = *src0;
+         src0_copy.data = mgr->get_pool();
++        src0_copy.buffer = nullptr;
+         src0_copy.ne[2] = mgr->get_capacity();
+         src0 = &src0_copy;
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 2278c7d9b..9cb510158 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1175,7 +1175,7 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++    if (src0->buffer != nullptr && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         const size_t size_data  = ggml_nbytes(src0);
+         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+         if (size_alloc > size_data) {
+-- 
+2.43.0.windows.1
+

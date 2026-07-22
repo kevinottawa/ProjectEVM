@@ -1,0 +1,3 @@
+model,capacity,hash_matches,tests,full_quality_passed,exact_evm_quality_passed
+qwen1,8,5,5,3,3
+deepseek,8,5,5,5,5

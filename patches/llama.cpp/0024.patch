@@ -1,0 +1,376 @@
+From 5572d9cd2ebf152a39fd841f8917b41d7f6a79f1 Mon Sep 17 00:00:00 2001
+From: kevinottawa <69475646+kevinottawa@users.noreply.github.com>
+Date: Tue, 14 Jul 2026 13:45:09 -0400
+Subject: [PATCH 24/26] Add reserved router-score EVM prefetch slots
+
+---
+ ggml/src/ggml-cuda/evm.cuh      | 106 ++++++++++++++++++++++----------
+ ggml/src/ggml-cuda/ggml-cuda.cu |  69 ++++++++++++++++++---
+ 2 files changed, 133 insertions(+), 42 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/evm.cuh b/ggml/src/ggml-cuda/evm.cuh
+index 050434119..3aa8465d1 100644
+--- a/ggml/src/ggml-cuda/evm.cuh
++++ b/ggml/src/ggml-cuda/evm.cuh
+@@ -337,6 +337,9 @@ class Manager {
+ private:
+     int capacity = 0;
+     int requested_capacity = 0;
++    int demand_capacity = 0;
++    int predictor_reserved_slots = 0;
++    int configured_predictor_reserved_slots = 0;
+     int budget_max_capacity = 0;
+     int total_experts = 0;
+     int expert_size_bytes = 0;
+@@ -351,6 +354,10 @@ private:
+     int* h_page_table = nullptr;
+     unsigned long long* d_page_status = nullptr; // [active expert mask, miss flag]
+     unsigned long long* h_page_status = nullptr;
++    int* d_router_candidates = nullptr;
++    int* h_router_candidates = nullptr;
++    float* d_router_candidate_scores = nullptr;
++    float* h_router_candidate_scores = nullptr;
+     int* h_physical_ids[2] = {nullptr, nullptr};
+     cudaEvent_t physical_ids_events[2] = {nullptr, nullptr};
+     bool physical_ids_event_recorded[2] = {false, false};
+@@ -453,8 +460,12 @@ public:
+         if (d_physical_ids) cudaFree(d_physical_ids);
+         if (d_page_table) cudaFree(d_page_table);
+         if (d_page_status) cudaFree(d_page_status);
++        if (d_router_candidates) cudaFree(d_router_candidates);
++        if (d_router_candidate_scores) cudaFree(d_router_candidate_scores);
+         if (h_page_table) cudaFreeHost(h_page_table);
+         if (h_page_status) cudaFreeHost(h_page_status);
++        if (h_router_candidates) cudaFreeHost(h_router_candidates);
++        if (h_router_candidate_scores) cudaFreeHost(h_router_candidate_scores);
+     }
+ 
+     void reset_cache_state() {
+@@ -483,10 +494,15 @@ public:
+             stream));
+     }
+ 
++    bool is_predictive_slot(int physical) const {
++        return physical >= demand_capacity;
++    }
++
+     std::list<int>::iterator eviction_candidate() {
+         auto it = lru_list.end();
+         while (it != lru_list.begin()) {
+             --it;
++            if (is_predictive_slot(*it)) continue;
+             const int logical = slots[*it].logical_expert_id;
+             if (logical < 0 || pinned_experts.find(logical) == pinned_experts.end()) return it;
+         }
+@@ -498,6 +514,7 @@ public:
+         auto it = lru_list.end();
+         while (it != lru_list.begin()) {
+             --it;
++            if (is_predictive_slot(*it)) continue;
+             const int logical = slots[*it].logical_expert_id;
+             if (logical < 0 || (pinned_experts.find(logical) == pinned_experts.end() && protected_ids.find(logical) == protected_ids.end())) {
+                 return it;
+@@ -520,6 +537,7 @@ public:
+         auto selected = lru_list.end();
+         float selected_score = 0.0f;
+         for (auto it = lru_list.begin(); it != lru_list.end(); ++it) {
++            if (is_predictive_slot(*it)) continue;
+             const int logical = slots[*it].logical_expert_id;
+             if (logical >= 0 && (pinned_experts.find(logical) != pinned_experts.end() || protected_ids.find(logical) != protected_ids.end())) continue;
+             const float score = logical < 0 ? -1.0f : scores[(size_t) logical];
+@@ -630,36 +648,37 @@ public:
+     // CUDA kernel could still read. The copy remains asynchronous with respect
+     // to current expert compute and becomes available to the next token.
+     void queue_router_score_prefetch_locked(
+-            const float * scores,
+-            int score_count,
++            const int * candidates,
++            const float * candidate_scores,
++            int candidate_count,
+             const std::unordered_set<int> & current_ids) {
+         if (read_env_ll("EVM_ROUTER_SCORE_PREFETCH", 0) == 0 ||
+-                ability_pack_only || gpu_page_table_enabled() || !scores || score_count != total_experts) {
++                ability_pack_only || gpu_page_table_enabled() || !candidates || !candidate_scores || candidate_count <= 0 || predictor_reserved_slots <= 0) {
+             return;
+         }
+         const int budget = std::max(0, std::min(4, (int) read_env_ll("EVM_ROUTER_SCORE_PREFETCH_COUNT", 1)));
+-        const float minimum = (float) read_env_ll("EVM_ROUTER_SCORE_PREFETCH_MIN_PPM", 0) / 1000000.0f;
++        const float minimum_score = (float) read_env_ll("EVM_ROUTER_SCORE_PREFETCH_MIN_PPM", 0) / 1000000.0f;
+         if (budget == 0) return;
+ 
+-        std::vector<int> candidates;
+-        candidates.reserve((size_t) total_experts);
+-        for (int expert = 0; expert < total_experts; ++expert) {
+-            if (scores[expert] >= minimum && cache_map.find(expert) == cache_map.end() &&
+-                    current_ids.find(expert) == current_ids.end() && pinned_experts.find(expert) == pinned_experts.end()) {
+-                candidates.push_back(expert);
+-            }
+-        }
+-        std::sort(candidates.begin(), candidates.end(), [&](int a, int b) { return scores[a] > scores[b]; });
+-
+         int queued = 0;
+-        for (const int candidate : candidates) {
++        for (int candidate_index = 0; candidate_index < candidate_count; ++candidate_index) {
+             if (queued >= budget) break;
+-            const auto empty = std::find_if(slots.begin(), slots.end(), [](const CacheSlot & slot) {
+-                return slot.logical_expert_id < 0;
++            const int candidate = candidates[candidate_index];
++            if (candidate_scores[candidate_index] < minimum_score || candidate < 0 || candidate >= total_experts || cache_map.find(candidate) != cache_map.end() ||
++                    current_ids.find(candidate) != current_ids.end() || pinned_experts.find(candidate) != pinned_experts.end()) {
++                continue;
++            }
++            const auto reserved = std::find_if(slots.begin() + demand_capacity, slots.end(), [&](const CacheSlot & slot) {
++                return slot.logical_expert_id < 0 || current_ids.find(slot.logical_expert_id) == current_ids.end();
+             });
+-            if (empty == slots.end()) break;
+-            const int physical = empty->physical_index;
+-            empty->logical_expert_id = candidate;
++            if (reserved == slots.end()) break;
++            const int physical = reserved->physical_index;
++            const int old_logical = reserved->logical_expert_id;
++            if (old_logical >= 0) {
++                cache_map.erase(old_logical);
++                prefetched_experts.erase(old_logical);
++            }
++            reserved->logical_expert_id = candidate;
+             const char * source = source_from_vault
+                 ? vault_registry().expert_data(vault_tensor_name, candidate, (size_t) expert_size_bytes)
+                 : h_experts_mmap + (size_t) candidate * expert_size_bytes;
+@@ -714,8 +733,8 @@ public:
+         }
+     }
+ 
+-    void resize_pool_locked(int new_capacity) {
+-        const int requested = std::max(1, std::min(new_capacity, total_experts));
++    void resize_pool_locked(int new_demand_capacity) {
++        int requested = std::max(1, std::min(new_demand_capacity, total_experts));
+         if (strict_budget && budget_max_capacity > 0 && requested > budget_max_capacity) {
+             fprintf(stderr,
+                     "EVM_BUDGET_NO_GO: strict budget exceeded: requested %d experts, budget allows %d. "
+@@ -725,8 +744,14 @@ public:
+             abort();
+         }
+ 
+-        new_capacity = requested;
+-        if (new_capacity == capacity && d_pool != nullptr) {
++        if (budget_max_capacity > 0) requested = std::min(requested, budget_max_capacity);
++        const int reserved = std::min(configured_predictor_reserved_slots, total_experts - requested);
++        int new_capacity = requested + reserved;
++        if (budget_max_capacity > 0) {
++            new_capacity = std::min(new_capacity, budget_max_capacity);
++        }
++        const int new_reserved = std::max(0, new_capacity - requested);
++        if (new_capacity == capacity && requested == demand_capacity && d_pool != nullptr) {
+             return;
+         }
+ 
+@@ -737,6 +762,8 @@ public:
+         }
+         d_pool = new_pool;
+         capacity = new_capacity;
++        demand_capacity = requested;
++        predictor_reserved_slots = new_reserved;
+         reset_cache_state();
+         if (ability_enabled) preload_ability_experts();
+         sync_gpu_page_table_locked();
+@@ -826,12 +853,18 @@ public:
+         const int fixed_capacity = (int) read_env_ll("EVM_EXPERTS_PER_TENSOR", 0);
+         if (fixed_capacity > 0) {
+             requested_capacity = std::max(1, std::min(fixed_capacity, total_experts));
+-            budget_max_capacity = std::min(budget_max_capacity, requested_capacity);
+         }
+         if (budget_max_capacity > 0) {
+             requested_capacity = std::min(requested_capacity, budget_max_capacity);
+         }
+-        capacity = requested_capacity;
++        configured_predictor_reserved_slots = std::max(0, std::min(4, (int) read_env_ll("EVM_PREDICTOR_RESERVED_SLOTS", 0)));
++        predictor_reserved_slots = std::min(configured_predictor_reserved_slots, total_experts - requested_capacity);
++        capacity = requested_capacity + predictor_reserved_slots;
++        if (budget_max_capacity > 0) {
++            capacity = std::min(capacity, budget_max_capacity);
++            predictor_reserved_slots = std::max(0, capacity - requested_capacity);
++        }
++        demand_capacity = requested_capacity;
+         CUDA_CHECK(cudaMalloc(&d_pool, (size_t)capacity * expert_size_bytes));
+         ensure_physical_ids_capacity_locked((int) read_env_ll("EVM_ID_BUFFER_CAPACITY", 65536));
+ 
+@@ -875,6 +908,10 @@ public:
+         CUDA_CHECK(cudaMallocHost(&h_page_table, (size_t) total_experts * sizeof(int)));
+         CUDA_CHECK(cudaMalloc(&d_page_status, 2 * sizeof(unsigned long long)));
+         CUDA_CHECK(cudaMallocHost(&h_page_status, 2 * sizeof(unsigned long long)));
++        CUDA_CHECK(cudaMalloc(&d_router_candidates, 8 * sizeof(int)));
++        CUDA_CHECK(cudaMallocHost(&h_router_candidates, 8 * sizeof(int)));
++        CUDA_CHECK(cudaMalloc(&d_router_candidate_scores, 8 * sizeof(float)));
++        CUDA_CHECK(cudaMallocHost(&h_router_candidate_scores, 8 * sizeof(float)));
+ 
+         reset_cache_state();
+         ability_enabled = getenv("EVM_ABILITY_PACK_INDEX") != nullptr;
+@@ -906,9 +943,10 @@ public:
+ 
+         if (pool_mb > 0 || reserve_mb > 0 || strict_budget) {
+             fprintf(stderr,
+-                    "EVM: budget controls active: requested_capacity=%d, budget_max_capacity=%d, "
++                    "EVM: budget controls active: demand_capacity=%d, reserved_predictive_slots=%d, budget_max_capacity=%d, "
+                     "expert_size=%.2f MB, strict=%d\n",
+                     requested_capacity,
++                    predictor_reserved_slots,
+                     budget_max_capacity,
+                     (double) expert_size_bytes / (1024.0 * 1024.0),
+                     strict_budget ? 1 : 0);
+@@ -977,7 +1015,7 @@ public:
+                 unique_ids.insert(logical_ids[i]);
+             }
+         }
+-        if ((int) unique_ids.size() > capacity) {
++        if ((int) unique_ids.size() > demand_capacity) {
+             resize_pool_locked((int) unique_ids.size());
+         }
+ 
+@@ -1097,7 +1135,7 @@ public:
+         CUDA_CHECK(cudaEventRecord(pool_reuse_event, compute_stream));
+         CUDA_CHECK(cudaStreamWaitEvent(stream, pool_reuse_event, 0));
+ 
+-        if ((int) logical_to_physical.size() > capacity) {
++        if ((int) logical_to_physical.size() > demand_capacity) {
+             resize_pool_locked((int) logical_to_physical.size());
+         }
+ 
+@@ -1232,6 +1270,10 @@ public:
+     int* get_page_table() { return d_page_table; }
+     unsigned long long* get_page_status() { return d_page_status; }
+     unsigned long long* get_host_page_status() { return h_page_status; }
++    int* get_router_candidates_device() { return d_router_candidates; }
++    int* get_router_candidates_host() { return h_router_candidates; }
++    float* get_router_candidate_scores_device() { return d_router_candidate_scores; }
++    float* get_router_candidate_scores_host() { return h_router_candidate_scores; }
+     int get_total_experts() const { return total_experts; }
+ 
+     bool gpu_page_table_enabled() const {
+@@ -1282,14 +1324,14 @@ public:
+         metric_gpu_page_attempts++;
+     }
+ 
+-    void queue_router_score_prefetch(const std::vector<float> & scores, const int * logical_ids, int count) {
+-        if (scores.empty() || !logical_ids || count <= 0) return;
++    void queue_router_score_prefetch(const std::vector<int> & candidates, const std::vector<float> & candidate_scores, const int * logical_ids, int count) {
++        if (candidates.empty() || candidate_scores.size() != candidates.size() || !logical_ids || count <= 0) return;
+         std::lock_guard<std::mutex> lock(mtx);
+         std::unordered_set<int> current_ids;
+         for (int i = 0; i < count; ++i) {
+             if (logical_ids[i] >= 0 && logical_ids[i] < total_experts) current_ids.insert(logical_ids[i]);
+         }
+-        queue_router_score_prefetch_locked(scores.data(), (int) scores.size(), current_ids);
++        queue_router_score_prefetch_locked(candidates.data(), candidate_scores.data(), (int) candidates.size(), current_ids);
+     }
+ 
+     void note_router_score_bridge(bool captured) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 452d3b220..9162c3bc8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1835,13 +1835,43 @@ static std::vector<int> ggml_cuda_evm_copy_ids_to_host(
+     return h_ids;
+ }
+ 
+-static std::vector<float> ggml_cuda_evm_copy_router_scores_to_host(
++static __global__ void ggml_cuda_evm_rank_router_candidates_kernel(
++        const float * scores,
++        int total_experts,
++        int candidate_count,
++        int * candidates,
++        float * candidate_scores) {
++    if (blockIdx.x != 0 || threadIdx.x != 0) return;
++    bool chosen[64] = {};
++    for (int rank = 0; rank < candidate_count; ++rank) {
++        float best = -INFINITY;
++        int best_expert = -1;
++        for (int expert = 0; expert < total_experts; ++expert) {
++            if (!chosen[expert] && scores[expert] > best) {
++                best = scores[expert];
++                best_expert = expert;
++            }
++        }
++        candidates[rank] = best_expert;
++        candidate_scores[rank] = best;
++        if (best_expert >= 0) chosen[best_expert] = true;
++    }
++}
++
++struct ggml_cuda_evm_router_candidates {
++    std::vector<int> ids;
++    std::vector<float> scores;
++};
++
++static ggml_cuda_evm_router_candidates ggml_cuda_evm_copy_router_candidates_to_host(
+         ggml_backend_cuda_context & ctx,
+         const ggml_tensor * ids,
+-        int total_experts) {
++        EVM::Manager * mgr) {
+     if (getenv("EVM_ROUTER_SCORE_PREFETCH") == nullptr || atoi(getenv("EVM_ROUTER_SCORE_PREFETCH")) == 0) {
+         return {};
+     }
++    const int total_experts = mgr->get_total_experts();
++    if (total_experts > 64) return {};
+     const ggml_tensor * scores = ids ? ids->src[0] : nullptr;
+     while (scores && (scores->op == GGML_OP_VIEW || scores->op == GGML_OP_RESHAPE ||
+             scores->op == GGML_OP_CONT || scores->op == GGML_OP_ARGSORT)) {
+@@ -1850,16 +1880,35 @@ static std::vector<float> ggml_cuda_evm_copy_router_scores_to_host(
+     if (!scores || scores->type != GGML_TYPE_F32 || scores->ne[0] != total_experts || scores->ne[1] <= 0 || !scores->data) {
+         return {};
+     }
+-    std::vector<float> h_scores((size_t) total_experts);
++    int candidate_count = 8;
++    if (const char * value = getenv("EVM_ROUTER_SCORE_CANDIDATES")) {
++        candidate_count = std::max(1, std::min(8, atoi(value)));
++    }
+     const int64_t row = scores->ne[1] - 1;
++    ggml_cuda_evm_rank_router_candidates_kernel<<<1, 1, 0, ctx.stream()>>>(
++        (const float *) ((const char *) scores->data + (size_t) row * scores->nb[1]),
++        total_experts,
++        candidate_count,
++        mgr->get_router_candidates_device(),
++        mgr->get_router_candidate_scores_device());
++    CUDA_CHECK(cudaGetLastError());
+     CUDA_CHECK(cudaMemcpyAsync(
+-        h_scores.data(),
+-        (const char *) scores->data + (size_t) row * scores->nb[1],
+-        (size_t) total_experts * sizeof(float),
++        mgr->get_router_candidates_host(),
++        mgr->get_router_candidates_device(),
++        (size_t) candidate_count * sizeof(int),
++        cudaMemcpyDeviceToHost,
++        ctx.stream()));
++    CUDA_CHECK(cudaMemcpyAsync(
++        mgr->get_router_candidate_scores_host(),
++        mgr->get_router_candidate_scores_device(),
++        (size_t) candidate_count * sizeof(float),
+         cudaMemcpyDeviceToHost,
+         ctx.stream()));
+     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+-    return h_scores;
++    return {
++        std::vector<int>(mgr->get_router_candidates_host(), mgr->get_router_candidates_host() + candidate_count),
++        std::vector<float>(mgr->get_router_candidate_scores_host(), mgr->get_router_candidate_scores_host() + candidate_count),
++    };
+ }
+ 
+ // Cache-hit remapping is a tiny GPU operation.  The output is contiguous even
+@@ -2003,12 +2052,12 @@ static bool ggml_cuda_evm_remap_mul_mat_id(
+     if (!ggml_cuda_evm_try_gpu_page_remap(ctx, ids, mgr, count)) {
+         std::vector<int> h_ids = ggml_cuda_evm_copy_ids_to_host(ctx, ids, count);
+         const std::vector<int> logical_ids = h_ids;
+-        const std::vector<float> router_scores = ggml_cuda_evm_copy_router_scores_to_host(ctx, ids, mgr->get_total_experts());
++        const ggml_cuda_evm_router_candidates router_candidates = ggml_cuda_evm_copy_router_candidates_to_host(ctx, ids, mgr);
+         if (getenv("EVM_ROUTER_SCORE_PREFETCH") != nullptr && atoi(getenv("EVM_ROUTER_SCORE_PREFETCH")) != 0) {
+-            mgr->note_router_score_bridge(!router_scores.empty());
++            mgr->note_router_score_bridge(!router_candidates.ids.empty());
+         }
+         mgr->ensure_experts(h_ids.data(), count, ctx.stream());
+-        mgr->queue_router_score_prefetch(router_scores, logical_ids.data(), count);
++        mgr->queue_router_score_prefetch(router_candidates.ids, router_candidates.scores, logical_ids.data(), count);
+     }
+ 
+     ggml_cuda_evm_rewrite_ids_view(ids, mgr, ids_copy, ids);
+-- 
+2.43.0.windows.1
+

@@ -1,0 +1,3 @@
+model,trials,lru_tps,learned_tps,tps_change_pct,lru_vram_mb,learned_vram_mb,lru_hit_rate_pct,learned_hit_rate_pct,exact_hash_matches
+deepseek,3,6.9,11.2,62.32,2898,2898,34.22,36.86,5/5
+qwen1,3,13.47,15.37,14.11,2646,2646,22.06,23.92,5/5

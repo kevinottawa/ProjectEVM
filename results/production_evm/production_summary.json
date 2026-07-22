@@ -1,0 +1,184 @@
+{
+  "memory_tiers": [
+    {
+      "mode": "Native max-GPU",
+      "backing": "WDDM/shared",
+      "generation_tps": 6.3,
+      "peak_gpu_memory_mb": 23951,
+      "peak_process_rss_mb": 24025,
+      "peak_process_private_mb": 34079,
+      "system_ram_used_delta_mb": 24902,
+      "pagefile_used_delta_mb": 5,
+      "trials": 1,
+      "status": "PASS"
+    },
+    {
+      "mode": "CPU-backed",
+      "backing": "Committed RAM",
+      "generation_tps": 3.9,
+      "peak_gpu_memory_mb": 5485,
+      "peak_process_rss_mb": 23719,
+      "peak_process_private_mb": 34327,
+      "system_ram_used_delta_mb": 24152,
+      "pagefile_used_delta_mb": 4192,
+      "trials": 1,
+      "status": "PASS"
+    },
+    {
+      "mode": "RAM unified 8",
+      "backing": "Committed RAM",
+      "generation_tps": 1.9,
+      "peak_gpu_memory_mb": 9116,
+      "peak_process_rss_mb": 24115,
+      "peak_process_private_mb": 37838,
+      "system_ram_used_delta_mb": 24616,
+      "pagefile_used_delta_mb": 5092,
+      "trials": 1,
+      "status": "PASS"
+    },
+    {
+      "mode": "Disk unified 8",
+      "backing": "Lazy GGUF mmap",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9146,
+      "peak_process_rss_mb": 4762,
+      "peak_process_private_mb": 9089,
+      "system_ram_used_delta_mb": 4807,
+      "pagefile_used_delta_mb": 0,
+      "trials": 3,
+      "status": "PASS"
+    }
+  ],
+  "disk_compact_generation_tps_mean": 0.4,
+  "disk_compact_peak_gpu_memory_mb_max": 9146,
+  "disk_compact_peak_process_rss_mb_max": 4762,
+  "disk_compact_pagefile_used_delta_mb_max": 0,
+  "speculative_generation_tps": 0.544,
+  "speculative_acceptance_pct": 40.0,
+  "disk_io_controls": [
+    {
+      "mode": "Strict trim",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9146,
+      "peak_process_rss_mb": 4762,
+      "pagefile_used_delta_mb": 0,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Lazy mmap",
+      "generation_tps": 0.6,
+      "peak_gpu_memory_mb": 9095,
+      "peak_process_rss_mb": 24160,
+      "pagefile_used_delta_mb": 49,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Pinned x2",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9386,
+      "peak_process_rss_mb": 4786,
+      "pagefile_used_delta_mb": 0,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Pinned x4",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9329,
+      "peak_process_rss_mb": 4755,
+      "pagefile_used_delta_mb": 70,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Pinned x8",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9265,
+      "peak_process_rss_mb": 4742,
+      "pagefile_used_delta_mb": 0,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Cache 8G",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9193,
+      "peak_process_rss_mb": 9449,
+      "pagefile_used_delta_mb": 0,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Cache 12G",
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9156,
+      "peak_process_rss_mb": 13907,
+      "pagefile_used_delta_mb": 0,
+      "has_evm_counters": true,
+      "status": "PASS"
+    },
+    {
+      "mode": "Cache 16G",
+      "generation_tps": 0.3,
+      "peak_gpu_memory_mb": 9153,
+      "peak_process_rss_mb": 16525,
+      "pagefile_used_delta_mb": 86,
+      "has_evm_counters": true,
+      "status": "PASS"
+    }
+  ],
+  "disk_gpu_pool_sweep": [
+    {
+      "experts_per_tensor": 8,
+      "generation_tps": 0.4,
+      "peak_gpu_memory_mb": 9146,
+      "peak_process_rss_mb": 4762,
+      "cache_hit_rate_pct": 32.08,
+      "bytes_transferred_mb": 59167.09,
+      "pagefile_used_delta_mb": 0,
+      "status": "PASS"
+    },
+    {
+      "experts_per_tensor": 16,
+      "generation_tps": 0.5,
+      "peak_gpu_memory_mb": 12896,
+      "peak_process_rss_mb": 4787,
+      "cache_hit_rate_pct": 48.85,
+      "bytes_transferred_mb": 44609.41,
+      "pagefile_used_delta_mb": 0,
+      "status": "PASS"
+    },
+    {
+      "experts_per_tensor": 24,
+      "generation_tps": 0.5,
+      "peak_gpu_memory_mb": 16459,
+      "peak_process_rss_mb": 4742,
+      "cache_hit_rate_pct": 58.81,
+      "bytes_transferred_mb": 35960.86,
+      "pagefile_used_delta_mb": 0,
+      "status": "PASS"
+    },
+    {
+      "experts_per_tensor": 32,
+      "generation_tps": 0.6,
+      "peak_gpu_memory_mb": 19894,
+      "peak_process_rss_mb": 4742,
+      "cache_hit_rate_pct": 64.84,
+      "bytes_transferred_mb": 30706.96,
+      "pagefile_used_delta_mb": 0,
+      "status": "PASS"
+    },
+    {
+      "experts_per_tensor": 40,
+      "generation_tps": 0.6,
+      "peak_gpu_memory_mb": 23530,
+      "peak_process_rss_mb": 4739,
+      "cache_hit_rate_pct": 70.42,
+      "bytes_transferred_mb": 25834.51,
+      "pagefile_used_delta_mb": 0,
+      "status": "PASS"
+    }
+  ]
+}
